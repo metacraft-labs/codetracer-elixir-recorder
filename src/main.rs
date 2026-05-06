@@ -11,7 +11,8 @@ use codetracer_ctfs::{ChunkedWriter, CompressionMethod, CtfsReader, CtfsWriter};
 use codetracer_trace_format_cbor_zstd::HEADERV1;
 use codetracer_trace_reader::{create_trace_reader, TraceEventsFileFormat as ReaderFormat};
 use codetracer_trace_types::{
-    EventLogKind, FunctionId, Line, TraceLowLevelEvent, TypeId, TypeKind, ValueRecord, VariableId,
+    EventLogKind, FieldTypeRecord, FullValueRecord, FunctionId, Line, TraceLowLevelEvent, TypeId,
+    TypeKind, TypeRecord, TypeSpecificInfo, ValueRecord, VariableId,
 };
 use codetracer_trace_writer::trace_writer::TraceWriter as RustTraceWriter;
 use codetracer_trace_writer_nim::{
@@ -385,6 +386,7 @@ struct RecordingSession {
     runtime: RuntimeSession,
     prepared_target: PreparedTarget,
     pending_drop_variable_names: Vec<Vec<String>>,
+    pending_value_events: Vec<PendingValueEvent>,
 }
 
 impl RecordingSession {
@@ -413,6 +415,7 @@ impl RecordingSession {
             runtime,
             prepared_target,
             pending_drop_variable_names: Vec::new(),
+            pending_value_events: Vec::new(),
         };
         session.initialize_writer()?;
         Ok(session)
@@ -486,7 +489,7 @@ impl RecordingSession {
         self.writer
             .close()
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))?;
-        self.write_ctfs_drop_variable_events()?;
+        self.write_ctfs_runtime_events()?;
 
         write_trace_meta_json(self, &runtime_result, target_exit_code)
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
@@ -503,10 +506,6 @@ impl RecordingSession {
             .iter()
             .map(|location| (location.location_id, location))
             .collect::<HashMap<_, _>>();
-        let integer_type = self.writer.ensure_type_id(TypeKind::Int, "integer");
-        let raw_type = self.writer.ensure_type_id(TypeKind::Raw, "term");
-        let none_type = self.writer.ensure_type_id(TypeKind::None, "None");
-
         for event in &runtime_result.trace_events {
             match event {
                 RuntimeTraceEvent::ThreadStart { thread_id, .. } => {
@@ -523,6 +522,7 @@ impl RecordingSession {
                     function,
                     arity,
                     args,
+                    source_language,
                     manifest_id,
                     function_key,
                     location_id,
@@ -541,10 +541,13 @@ impl RecordingSession {
                         .iter()
                         .enumerate()
                         .map(|(index, value)| {
-                            self.writer.arg(
-                                &format!("_arg{index}"),
-                                json_to_trace_value(value, integer_type, raw_type, none_type),
-                            )
+                            let arg_name = format!("_arg{index}");
+                            self.pending_value_events.push(PendingValueEvent {
+                                variable_name: arg_name.clone(),
+                                value: value.clone(),
+                            });
+                            let trace_value = json_to_trace_value(&mut self.writer, value);
+                            self.writer.arg(&arg_name, trace_value)
                         })
                         .collect::<Vec<_>>();
                     if manifest_id.is_some() || location_id.is_some() {
@@ -553,6 +556,7 @@ impl RecordingSession {
                             "module": module,
                             "function": function,
                             "arity": arity,
+                            "source_language": source_language,
                             "manifest_id": manifest_id,
                             "function_key": function_key,
                             "location_id": location_id,
@@ -582,16 +586,13 @@ impl RecordingSession {
                     return_value: Some(value),
                     ..
                 } => {
-                    self.writer.register_return(json_to_trace_value(
-                        value,
-                        integer_type,
-                        raw_type,
-                        none_type,
-                    ));
+                    let trace_value = json_to_trace_value(&mut self.writer, value);
+                    self.writer.register_return(trace_value);
                 }
                 RuntimeTraceEvent::Return {
                     return_value: None, ..
                 } => {
+                    let none_type = self.writer.ensure_type_id(TypeKind::None, "None");
                     self.writer
                         .register_return(ValueRecord::None { type_id: none_type });
                 }
@@ -603,10 +604,13 @@ impl RecordingSession {
                     name,
                     value,
                 } => {
-                    self.writer.register_variable_with_full_value(
-                        name,
-                        json_to_trace_value(value, integer_type, raw_type, none_type),
-                    );
+                    self.pending_value_events.push(PendingValueEvent {
+                        variable_name: name.clone(),
+                        value: value.clone(),
+                    });
+                    let trace_value = json_to_trace_value(&mut self.writer, value);
+                    self.writer
+                        .register_variable_with_full_value(name, trace_value);
                     let payload = serde_json::json!({
                         "schema": "codetracer.beam.variable-binding.v1",
                         "event": "variable_bind",
@@ -683,23 +687,29 @@ impl RecordingSession {
         Ok(())
     }
 
-    fn write_ctfs_drop_variable_events(&self) -> Result<(), RecorderDiagnostic> {
+    fn write_ctfs_runtime_events(&self) -> Result<(), RecorderDiagnostic> {
         if !matches!(
             self.options.format,
             OutputFormat::Ctfs | OutputFormat::Binary
-        ) || self.pending_drop_variable_names.is_empty()
+        ) || (self.pending_drop_variable_names.is_empty()
+            && self.pending_value_events.is_empty())
         {
             return Ok(());
         }
 
         let trace_path = self.out_dir.join(format!("{}.ct", self.program_name));
-        append_drop_variables_to_ctfs(&trace_path, &self.pending_drop_variable_names)
-            .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
+        append_runtime_events_to_ctfs(
+            &trace_path,
+            &self.pending_value_events,
+            &self.pending_drop_variable_names,
+        )
+        .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
     }
 }
 
-fn append_drop_variables_to_ctfs(
+fn append_runtime_events_to_ctfs(
     trace_path: &Path,
+    pending_values: &[PendingValueEvent],
     drop_variable_groups: &[Vec<String>],
 ) -> Result<(), Box<dyn Error>> {
     let mut reader = CtfsReader::open(trace_path)?;
@@ -737,20 +747,46 @@ fn append_drop_variables_to_ctfs(
         .enumerate()
         .map(|(id, name)| (name.clone(), VariableId(id)))
         .collect::<BTreeMap<_, _>>();
+    let mut type_records = Vec::new();
+    for event in &existing_events {
+        if let TraceLowLevelEvent::Type(record) = event {
+            type_records.push(record.clone());
+        }
+    }
+    let mut type_ids = type_records
+        .iter()
+        .enumerate()
+        .map(|(id, record)| (type_record_key(record), TypeId(id)))
+        .collect::<BTreeMap<_, _>>();
 
     let mut events = Vec::new();
+    for pending in pending_values {
+        let variable_id = ensure_low_level_variable(
+            &pending.variable_name,
+            &mut variable_names,
+            &mut variable_ids,
+            &mut events,
+        );
+        let value = json_to_low_level_trace_value(
+            &pending.value,
+            &mut type_records,
+            &mut type_ids,
+            &mut events,
+        )?;
+        events.push(TraceLowLevelEvent::Value(FullValueRecord {
+            variable_id,
+            value,
+        }));
+    }
     for group in drop_variable_groups {
         let mut ids = Vec::new();
         for name in group {
-            let id = if let Some(id) = variable_ids.get(name) {
-                *id
-            } else {
-                let id = VariableId(variable_names.len());
-                variable_names.push(name.clone());
-                variable_ids.insert(name.clone(), id);
-                events.push(TraceLowLevelEvent::VariableName(name.clone()));
-                id
-            };
+            let id = ensure_low_level_variable(
+                name,
+                &mut variable_names,
+                &mut variable_ids,
+                &mut events,
+            );
             ids.push(id);
         }
         if !ids.is_empty() {
@@ -797,6 +833,55 @@ fn append_drop_variables_to_ctfs(
 
     writer.close()?;
     Ok(())
+}
+
+fn ensure_low_level_variable(
+    name: &str,
+    variable_names: &mut Vec<String>,
+    variable_ids: &mut BTreeMap<String, VariableId>,
+    events: &mut Vec<TraceLowLevelEvent>,
+) -> VariableId {
+    if let Some(id) = variable_ids.get(name) {
+        *id
+    } else {
+        let id = VariableId(variable_names.len());
+        variable_names.push(name.to_string());
+        variable_ids.insert(name.to_string(), id);
+        events.push(TraceLowLevelEvent::VariableName(name.to_string()));
+        id
+    }
+}
+
+fn type_record_key(record: &TypeRecord) -> String {
+    format!(
+        "{:?}\x1f{}\x1f{:?}",
+        record.kind, record.lang_type, record.specific_info
+    )
+}
+
+fn ensure_low_level_type(
+    kind: TypeKind,
+    lang_type: &str,
+    specific_info: TypeSpecificInfo,
+    type_records: &mut Vec<TypeRecord>,
+    type_ids: &mut BTreeMap<String, TypeId>,
+    events: &mut Vec<TraceLowLevelEvent>,
+) -> TypeId {
+    let record = TypeRecord {
+        kind,
+        lang_type: lang_type.to_string(),
+        specific_info,
+    };
+    let key = type_record_key(&record);
+    if let Some(id) = type_ids.get(&key) {
+        *id
+    } else {
+        let id = TypeId(type_records.len());
+        type_records.push(record.clone());
+        type_ids.insert(key, id);
+        events.push(TraceLowLevelEvent::Type(record));
+        id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -905,6 +990,7 @@ struct RuntimeSidecarEvent {
     location_id: Option<u32>,
     clause_id: Option<u32>,
     source_location: Option<ResolvedSourceLocation>,
+    source_language: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -999,6 +1085,7 @@ enum RuntimeTraceEvent {
         function: String,
         arity: u32,
         args: Vec<serde_json::Value>,
+        source_language: Option<String>,
         manifest_id: Option<String>,
         function_key: Option<String>,
         location_id: Option<u32>,
@@ -1057,6 +1144,12 @@ struct RuntimeDroppedVariable {
     slot: u32,
     slot_template: String,
     name: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingValueEvent {
+    variable_name: String,
+    value: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1394,6 +1487,7 @@ impl RuntimeSession {
                         function: require_sidecar_string(&event, "function", line_number + 1)?,
                         arity: require_sidecar_u32(&event, "arity", line_number + 1)?,
                         args: event.args.unwrap_or_default(),
+                        source_language: event.source_language,
                         manifest_id: event.manifest_id,
                         function_key: event.function_key,
                         location_id: event.location_id,
@@ -1675,33 +1769,298 @@ fn function_display_name(function: &TraceFunctionSpec) -> String {
     )
 }
 
-fn json_to_trace_value(
+fn json_to_trace_value(writer: &mut NimTraceWriter, value: &serde_json::Value) -> ValueRecord {
+    json_to_trace_value_with(value, &mut |kind, lang_type, _specific_info| {
+        writer.ensure_type_id(kind, lang_type)
+    })
+    .unwrap_or_else(|error| {
+        let type_id = writer.ensure_type_id(TypeKind::Error, "beam_encoder_error");
+        ValueRecord::Error {
+            msg: error,
+            type_id,
+        }
+    })
+}
+
+fn json_to_low_level_trace_value(
     value: &serde_json::Value,
-    integer_type: TypeId,
-    raw_type: TypeId,
-    none_type: TypeId,
-) -> ValueRecord {
-    match value {
-        serde_json::Value::Number(number) => number
-            .as_i64()
-            .map(|i| ValueRecord::Int {
-                i,
-                type_id: integer_type,
-            })
-            .unwrap_or_else(|| ValueRecord::Raw {
-                r: number.to_string(),
-                type_id: raw_type,
-            }),
-        serde_json::Value::Null => ValueRecord::None { type_id: none_type },
-        serde_json::Value::String(text) => ValueRecord::Raw {
-            r: text.clone(),
-            type_id: raw_type,
-        },
-        other => ValueRecord::Raw {
-            r: other.to_string(),
-            type_id: raw_type,
-        },
+    type_records: &mut Vec<TypeRecord>,
+    type_ids: &mut BTreeMap<String, TypeId>,
+    events: &mut Vec<TraceLowLevelEvent>,
+) -> Result<ValueRecord, String> {
+    json_to_trace_value_with(value, &mut |kind, lang_type, specific_info| {
+        ensure_low_level_type(
+            kind,
+            lang_type,
+            specific_info,
+            type_records,
+            type_ids,
+            events,
+        )
+    })
+}
+
+fn json_to_trace_value_with<F>(
+    value: &serde_json::Value,
+    ensure_type: &mut F,
+) -> Result<ValueRecord, String>
+where
+    F: FnMut(TypeKind, &str, TypeSpecificInfo) -> TypeId,
+{
+    let Some(object) = value.as_object() else {
+        let type_id = ensure_type(TypeKind::Raw, "term", TypeSpecificInfo::None);
+        return Ok(ValueRecord::Raw {
+            r: value.to_string(),
+            type_id,
+        });
+    };
+    if object
+        .get("ct_value_schema")
+        .and_then(serde_json::Value::as_str)
+        != Some("codetracer.beam.value.v1")
+    {
+        let type_id = ensure_type(TypeKind::Raw, "term", TypeSpecificInfo::None);
+        return Ok(ValueRecord::Raw {
+            r: value.to_string(),
+            type_id,
+        });
     }
+
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "beam value missing kind".to_string())?;
+    let lang_type = object
+        .get("lang_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("term");
+    let type_kind = object
+        .get("type_kind")
+        .and_then(serde_json::Value::as_str)
+        .and_then(type_kind_from_name)
+        .unwrap_or(TypeKind::Raw);
+
+    match kind {
+        "int" => {
+            let type_id = ensure_type(TypeKind::Int, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Int {
+                i: object
+                    .get("value")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| "beam int missing i64 value".to_string())?,
+                type_id,
+            })
+        }
+        "bigint" => {
+            let type_id = ensure_type(TypeKind::Int, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::BigInt {
+                b: decode_hex(
+                    object
+                        .get("bytes_hex")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                )?,
+                negative: object
+                    .get("negative")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                type_id,
+            })
+        }
+        "float" => {
+            let type_id = ensure_type(TypeKind::Float, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Float {
+                f: object
+                    .get("value")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| "beam float missing f64 value".to_string())?,
+                type_id,
+            })
+        }
+        "bool" => {
+            let type_id = ensure_type(TypeKind::Bool, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Bool {
+                b: object
+                    .get("value")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| "beam bool missing bool value".to_string())?,
+                type_id,
+            })
+        }
+        "none" => {
+            let type_id = ensure_type(TypeKind::None, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::None { type_id })
+        }
+        "string" => {
+            let type_id = ensure_type(TypeKind::String, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::String {
+                text: object
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                type_id,
+            })
+        }
+        "list" => {
+            let elements = object
+                .get("elements")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| json_to_trace_value_with(value, ensure_type))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let type_id = ensure_type(TypeKind::Seq, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Sequence {
+                elements,
+                is_slice: false,
+                type_id,
+            })
+        }
+        "tuple" => {
+            let elements = object
+                .get("elements")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| json_to_trace_value_with(value, ensure_type))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let type_id = ensure_type(TypeKind::Tuple, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Tuple { elements, type_id })
+        }
+        "map_struct" | "record" => {
+            let mut field_values = Vec::new();
+            let mut field_types = Vec::new();
+            for field in object
+                .get("fields")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let name = field
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<field>")
+                    .to_string();
+                let value = json_to_trace_value_with(
+                    field
+                        .get("value")
+                        .ok_or_else(|| "beam struct field missing value".to_string())?,
+                    ensure_type,
+                )?;
+                field_types.push(FieldTypeRecord {
+                    name,
+                    type_id: value_type_id(&value).unwrap_or(TypeId(0)),
+                });
+                field_values.push(value);
+            }
+            let type_id = ensure_type(
+                TypeKind::Struct,
+                lang_type,
+                TypeSpecificInfo::Struct {
+                    fields: field_types,
+                },
+            );
+            Ok(ValueRecord::Struct {
+                field_values,
+                type_id,
+            })
+        }
+        "truncated" => {
+            let type_id = ensure_type(TypeKind::NonExpanded, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Raw {
+                r: object
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("[truncated]")
+                    .to_string(),
+                type_id,
+            })
+        }
+        "raw" | "atom" => {
+            let type_id = ensure_type(type_kind, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Raw {
+                r: object
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                type_id,
+            })
+        }
+        other => {
+            let type_id = ensure_type(TypeKind::Raw, lang_type, TypeSpecificInfo::None);
+            Ok(ValueRecord::Raw {
+                r: format!("[unsupported beam value kind {other}]"),
+                type_id,
+            })
+        }
+    }
+}
+
+fn value_type_id(value: &ValueRecord) -> Option<TypeId> {
+    match value {
+        ValueRecord::Int { type_id, .. }
+        | ValueRecord::Float { type_id, .. }
+        | ValueRecord::Bool { type_id, .. }
+        | ValueRecord::String { type_id, .. }
+        | ValueRecord::Sequence { type_id, .. }
+        | ValueRecord::Tuple { type_id, .. }
+        | ValueRecord::Struct { type_id, .. }
+        | ValueRecord::Variant { type_id, .. }
+        | ValueRecord::Reference { type_id, .. }
+        | ValueRecord::Raw { type_id, .. }
+        | ValueRecord::Error { type_id, .. }
+        | ValueRecord::None { type_id }
+        | ValueRecord::BigInt { type_id, .. }
+        | ValueRecord::Char { type_id, .. } => Some(*type_id),
+        ValueRecord::Cell { .. } => None,
+    }
+}
+
+fn type_kind_from_name(name: &str) -> Option<TypeKind> {
+    match name {
+        "Seq" => Some(TypeKind::Seq),
+        "Set" => Some(TypeKind::Set),
+        "Array" => Some(TypeKind::Array),
+        "Struct" => Some(TypeKind::Struct),
+        "Int" => Some(TypeKind::Int),
+        "Float" => Some(TypeKind::Float),
+        "String" => Some(TypeKind::String),
+        "Char" => Some(TypeKind::Char),
+        "Bool" => Some(TypeKind::Bool),
+        "Ref" => Some(TypeKind::Ref),
+        "Raw" => Some(TypeKind::Raw),
+        "TableKind" => Some(TypeKind::TableKind),
+        "FunctionKind" => Some(TypeKind::FunctionKind),
+        "Tuple" => Some(TypeKind::Tuple),
+        "None" => Some(TypeKind::None),
+        "NonExpanded" => Some(TypeKind::NonExpanded),
+        "Error" => Some(TypeKind::Error),
+        "Any" => Some(TypeKind::Any),
+        _ => None,
+    }
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err("hex string has odd length".to_string());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&text[index..index + 2], 16)
+                .map_err(|error| format!("invalid hex byte: {error}"))
+        })
+        .collect()
 }
 
 fn is_beam_target(target_command: &str) -> bool {
@@ -1733,6 +2092,7 @@ fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, 
         "codetracer_erlang_runtime.erl",
         "codetracer_session.erl",
         "codetracer_forms.erl",
+        "codetracer_value_encoder.erl",
     ] {
         let source = src_dir.join(module);
         let output = compile_erlang_runtime_source(&source, &ebin_dir, compiler)?;

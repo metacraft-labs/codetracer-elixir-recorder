@@ -6,7 +6,9 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codetracer_ctfs::CtfsReader;
-use codetracer_trace_types::{FullValueRecord, TraceLowLevelEvent, ValueRecord};
+use codetracer_trace_types::{
+    FullValueRecord, TraceLowLevelEvent, TypeKind, TypeRecord, ValueRecord,
+};
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use serde_json::Value;
 
@@ -137,6 +139,19 @@ fn compile_erlang_branch_fixture(ebin_dir: &Path) {
         .arg(&source)
         .output()
         .expect("run erlc for branch_forms");
+    assert_success(&compile, &format!("erlc {}", source.display()));
+}
+
+fn compile_erlang_value_matrix_fixture(ebin_dir: &Path) {
+    fs::create_dir_all(ebin_dir).expect("create value_matrix fixture ebin dir");
+    let source = repo_root().join("test-programs/erlang/value_matrix/src/value_matrix.erl");
+    let compile = Command::new("erlc")
+        .arg("+debug_info")
+        .arg("-o")
+        .arg(ebin_dir)
+        .arg(&source)
+        .output()
+        .expect("run erlc for value_matrix");
     assert_success(&compile, &format!("erlc {}", source.display()));
 }
 
@@ -342,6 +357,51 @@ fn record_erlang_branch_function(label: &str, function: &str) -> RecordedTrace {
         .expect("run Erlang branch fixture under runtime session");
 
     RecordedTrace { out_dir, output }
+}
+
+fn record_erlang_value_matrix_function_with_env(
+    label: &str,
+    function: &str,
+    envs: &[(&str, &str)],
+) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/value_matrix");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_value_matrix_fixture(&ebin_dir);
+
+    let mut command = clean_recorder_command();
+    command
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "value_matrix",
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .expect("run Erlang value_matrix fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
+fn record_erlang_value_matrix_function(label: &str, function: &str) -> RecordedTrace {
+    record_erlang_value_matrix_function_with_env(label, function, &[])
 }
 
 fn record_erlang_generated_source_map_function(label: &str, function: &str) -> RecordedTrace {
@@ -684,7 +744,7 @@ fn assert_sidecar_binding(binds: &[Value], name: &str, value: i64) {
     assert!(
         binds.iter().any(|event| {
             event["name"] == name
-                && event["value"].as_i64() == Some(value)
+                && reader_value_int(&event["value"]) == Some(value)
                 && event["frame_id"].as_u64().is_some()
                 && event["runtime_variable_id"].as_u64().is_some()
                 && event["slot_template"]
@@ -843,6 +903,101 @@ fn raw_ctfs_drop_variable_names(out_dir: &Path, trace_file: &str) -> Vec<Vec<Str
     drops
 }
 
+fn raw_ctfs_low_level_values(out_dir: &Path, trace_file: &str) -> Vec<(String, ValueRecord)> {
+    let ct_path = out_dir.join(trace_file);
+    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "read raw CTFS low-level events from {}: {error}",
+                ct_path.display()
+            )
+        });
+    let mut varnames = Vec::new();
+    let mut values = Vec::new();
+    for event in events {
+        match event {
+            TraceLowLevelEvent::VariableName(name) | TraceLowLevelEvent::Variable(name) => {
+                varnames.push(name);
+            }
+            TraceLowLevelEvent::Value(full) => {
+                let name = varnames
+                    .get(full.variable_id.0)
+                    .cloned()
+                    .unwrap_or_else(|| format!("<unknown:{}>", full.variable_id.0));
+                values.push((name, full.value));
+            }
+            _ => {}
+        }
+    }
+    values
+}
+
+fn raw_ctfs_low_level_types(out_dir: &Path, trace_file: &str) -> Vec<TypeRecord> {
+    let ct_path = out_dir.join(trace_file);
+    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "read raw CTFS low-level events from {}: {error}",
+                ct_path.display()
+            )
+        });
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            TraceLowLevelEvent::Type(record) => Some(record),
+            _ => None,
+        })
+        .collect()
+}
+
+fn find_named_value<'a>(values: &'a [(String, ValueRecord)], name: &str) -> &'a ValueRecord {
+    values
+        .iter()
+        .rev()
+        .find(|(observed, _)| observed == name)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("missing raw CTFS value for {name}: {values:#?}"))
+}
+
+fn type_for_value<'a>(value: &ValueRecord, types: &'a [TypeRecord]) -> &'a TypeRecord {
+    let type_id = match value {
+        ValueRecord::Int { type_id, .. }
+        | ValueRecord::Float { type_id, .. }
+        | ValueRecord::Bool { type_id, .. }
+        | ValueRecord::String { type_id, .. }
+        | ValueRecord::Sequence { type_id, .. }
+        | ValueRecord::Tuple { type_id, .. }
+        | ValueRecord::Struct { type_id, .. }
+        | ValueRecord::Variant { type_id, .. }
+        | ValueRecord::Reference { type_id, .. }
+        | ValueRecord::Raw { type_id, .. }
+        | ValueRecord::Error { type_id, .. }
+        | ValueRecord::None { type_id }
+        | ValueRecord::BigInt { type_id, .. }
+        | ValueRecord::Char { type_id, .. } => type_id.0,
+        ValueRecord::Cell { .. } => panic!("cell values do not carry a type_id"),
+    };
+    types
+        .get(type_id)
+        .unwrap_or_else(|| panic!("missing type_id {type_id} in {types:#?}"))
+}
+
+fn assert_value_type(
+    values: &[(String, ValueRecord)],
+    types: &[TypeRecord],
+    name: &str,
+    expected_kind: TypeKind,
+    expected_lang_type: &str,
+) {
+    let value = find_named_value(values, name);
+    let record = type_for_value(value, types);
+    assert_eq!(
+        (record.kind, record.lang_type.as_str()),
+        (expected_kind, expected_lang_type),
+        "unexpected type for {name}: value={value:#?} type={record:#?}"
+    );
+}
+
 fn assert_raw_ctfs_drop(drops: &[Vec<String>], name: &str) {
     assert!(
         drops
@@ -888,13 +1043,20 @@ fn collect_reader_value_pairs(value: &Value, varnames: &[String], out: &mut Vec<
 fn reader_value_int(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) => number.as_i64(),
-        Value::Object(map) => map
-            .get("i")
-            .or_else(|| map.get("Int"))
-            .and_then(Value::as_i64),
+        Value::Object(map) => map.get("value").and_then(reader_value_int).or_else(|| {
+            map.get("i")
+                .or_else(|| map.get("Int"))
+                .and_then(Value::as_i64)
+        }),
         Value::Array(values) => values.iter().find_map(reader_value_int),
         _ => None,
     }
+}
+
+fn sidecar_value_display(value: &Value) -> String {
+    reader_value_int(value)
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn assert_reader_value(pairs: &[(String, i64)], name: &str, value: i64) {
@@ -1025,7 +1187,7 @@ fn e2e_runtime_records_canonical_call_return_sequence() {
                 event["module"].as_str()?,
                 event["function"].as_str()?,
                 event["arity"].as_u64()?,
-                event["return_value"]
+                sidecar_value_display(&event["return_value"])
             )),
             _ => None,
         })
@@ -1809,6 +1971,219 @@ fn e2e_clause_entry_bindings_match_golden() {
     let raw_drops = raw_ctfs_drop_variable_names(&recorded.out_dir, "erl.ct");
     assert_raw_ctfs_drop(&raw_drops, "FinalResult");
     assert_raw_ctfs_drop(&raw_drops, "Result");
+}
+
+#[test]
+fn e2e_value_encoder_real_term_matrix() {
+    let recorded = record_erlang_value_matrix_function("m10-value-matrix", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "value-matrix-ok\n"
+    );
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    let types = raw_ctfs_low_level_types(&recorded.out_dir, "erl.ct");
+
+    assert!(matches!(
+        find_named_value(&values, "SmallInt"),
+        ValueRecord::Int { i: 42, .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "BigInt"),
+        ValueRecord::BigInt { negative: false, b, .. } if !b.is_empty()
+    ));
+    assert!(matches!(
+        find_named_value(&values, "Float"),
+        ValueRecord::Float { f, .. } if (*f - 3.25).abs() < f64::EPSILON
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TrueValue"),
+        ValueRecord::Bool { b: true, .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "FalseValue"),
+        ValueRecord::Bool { b: false, .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "AtomValue"),
+        ValueRecord::Raw { r, .. } if r == "sample_atom"
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TupleValue"),
+        ValueRecord::Tuple { elements, .. } if elements.len() == 3
+    ));
+    assert!(matches!(
+        find_named_value(&values, "EmptyList"),
+        ValueRecord::Sequence { elements, .. } if elements.is_empty()
+    ));
+    assert!(matches!(
+        find_named_value(&values, "ListValue"),
+        ValueRecord::Sequence { elements, .. } if elements.len() == 3
+    ));
+    assert!(matches!(
+        find_named_value(&values, "StringBinary"),
+        ValueRecord::String { text, .. } if text == "hello utf8"
+    ));
+    assert!(matches!(
+        find_named_value(&values, "RawBinary"),
+        ValueRecord::Raw { r, .. } if r.starts_with("0x00FF1041")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "InvalidUtf8Binary"),
+        ValueRecord::Raw { r, .. } if r.starts_with("0xFFFEFD")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "SimpleMap"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "ComplexMap"),
+        ValueRecord::Raw { r, .. } if r.contains("complex")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "RecordValue"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 3
+    ));
+    assert!(matches!(
+        find_named_value(&values, "PidValue"),
+        ValueRecord::Raw { .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "RefValue"),
+        ValueRecord::Raw { .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "PortValue"),
+        ValueRecord::Raw { .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "FunValue"),
+        ValueRecord::Raw { .. }
+    ));
+
+    assert_value_type(&values, &types, "SmallInt", TypeKind::Int, "integer");
+    assert_value_type(&values, &types, "StringBinary", TypeKind::String, "binary");
+    assert_value_type(&values, &types, "SimpleMap", TypeKind::Struct, "map");
+    assert_value_type(
+        &values,
+        &types,
+        "RecordValue",
+        TypeKind::Struct,
+        "record:person",
+    );
+    assert_value_type(&values, &types, "PidValue", TypeKind::Ref, "pid");
+    assert_value_type(&values, &types, "RefValue", TypeKind::Ref, "reference");
+    assert_value_type(&values, &types, "PortValue", TypeKind::Ref, "port");
+    assert_value_type(&values, &types, "FunValue", TypeKind::FunctionKind, "fun");
+}
+
+#[test]
+fn e2e_value_truncation_limits_real_trace() {
+    let recorded = record_erlang_value_matrix_function_with_env(
+        "m10-truncation",
+        "truncation",
+        &[
+            ("CODETRACER_ELIXIR_VALUE_MAX_DEPTH", "2"),
+            ("CODETRACER_ELIXIR_VALUE_MAX_SEQUENCE_ITEMS", "3"),
+            ("CODETRACER_ELIXIR_VALUE_MAX_BINARY_BYTES", "4"),
+            ("CODETRACER_ELIXIR_VALUE_MAX_MAP_PAIRS", "2"),
+            ("CODETRACER_ELIXIR_VALUE_MAX_STRING_BYTES", "5"),
+        ],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "truncation-ok\n"
+    );
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    let long_list = find_named_value(&values, "LongList");
+    assert!(matches!(
+        long_list,
+        ValueRecord::Sequence { elements, .. }
+            if elements.len() == 4
+                && matches!(elements.last(), Some(ValueRecord::Raw { r, .. }) if r == "[truncated]")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LongString"),
+        ValueRecord::String { text, .. } if text == "aaaaa..."
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LongRawBinary"),
+        ValueRecord::Raw { r, .. } if r == "0x00FF1041..."
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LargeMap"),
+        ValueRecord::Struct { field_values, .. }
+            if field_values.iter().any(|value| matches!(value, ValueRecord::Raw { r, .. } if r == "[truncated]"))
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LargeComplexMap"),
+        ValueRecord::Raw { r, .. } if r.len() <= 7 && r.ends_with("...")
+    ));
+    assert!(format!("{:#?}", find_named_value(&values, "Deep")).contains("[truncated]"));
+}
+
+#[test]
+fn e2e_elixir_nil_erlang_empty_list_distinction() {
+    let elixir_recorded = record_elixir_fixture_expression(
+        "m10-elixir-nil",
+        "value_matrix",
+        "ValueMatrix.identity(nil); ValueMatrix.identity([]); IO.puts(\"nil-list-ok\")",
+    );
+    assert_eq!(
+        elixir_recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&elixir_recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&elixir_recorded.output.stdout),
+        "nil-list-ok\n"
+    );
+    let elixir_values = raw_ctfs_low_level_values(&elixir_recorded.out_dir, "mix.ct");
+    let arg0_values = elixir_values
+        .iter()
+        .filter(|(name, _)| name == "_arg0")
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    assert!(
+        arg0_values
+            .iter()
+            .any(|value| matches!(value, ValueRecord::None { .. })),
+        "Elixir nil should be encoded as None through raw CTFS values: {arg0_values:#?}"
+    );
+    assert!(
+        arg0_values.iter().any(
+            |value| matches!(value, ValueRecord::Sequence { elements, .. } if elements.is_empty())
+        ),
+        "Elixir [] should remain an empty list through raw CTFS values: {arg0_values:#?}"
+    );
+
+    let erlang_recorded = record_erlang_value_matrix_function("m10-erlang-empty-list", "main");
+    assert_eq!(
+        erlang_recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&erlang_recorded.output)
+    );
+    let erlang_values = raw_ctfs_low_level_values(&erlang_recorded.out_dir, "erl.ct");
+    let list_value = find_named_value(&erlang_values, "EmptyList");
+    assert!(
+        matches!(list_value, ValueRecord::Sequence { elements, .. } if elements.is_empty()),
+        "Erlang [] should remain an empty list sequence, not None: {list_value:#?}"
+    );
 }
 
 #[test]

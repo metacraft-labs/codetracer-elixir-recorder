@@ -185,6 +185,7 @@ build_manifest_index(TraceFunctions) ->
 
 trace_function_metadata({_Module, _Function, _Arity, _Kind, SourcePath, Line}) ->
     #{
+        source_language => "erlang",
         manifest_id => undefined,
         function_key => undefined,
         location_id => undefined,
@@ -197,8 +198,9 @@ trace_function_metadata({_Module, _Function, _Arity, _Kind, SourcePath, Line}) -
             resolution => "erl_anno"
         }
     };
-trace_function_metadata({_Module, _Function, _Arity, _Kind, _SourcePath, _Line, ManifestId, FunctionKey, LocationId, ClauseId, ResolvedSourcePath, ResolvedLine, ResolvedColumn, ResolutionStrategy, TraceCopyPath}) ->
+trace_function_metadata({_Module, _Function, _Arity, Kind, _SourcePath, _Line, ManifestId, FunctionKey, LocationId, ClauseId, ResolvedSourcePath, ResolvedLine, ResolvedColumn, ResolutionStrategy, TraceCopyPath}) ->
     #{
+        source_language => flatten_text(Kind),
         manifest_id => ManifestId,
         function_key => FunctionKey,
         location_id => LocationId,
@@ -312,6 +314,7 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
     {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
     Metadata = source_metadata(Module, Function, length(Args), State1),
     {FrameId, State} = push_frame(Pid, Metadata, State1),
+    SourceLanguage = maps:get(source_language, Metadata, "erlang"),
     Line = [
         "{\"event\":\"call\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
@@ -320,8 +323,9 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(length(Args)), ",",
+        "\"source_language\":", json_string(SourceLanguage), ",",
         source_metadata_json(Metadata), ",",
-        "\"args\":[", join_json_terms(Args), "]",
+        "\"args\":[", join_json_terms(Args, SourceLanguage), "]",
         "}\n"
     ],
     ok = file:write(File, Line),
@@ -329,6 +333,7 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
 write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     {FrameInfo, State1} = pop_frame(Pid, State),
+    SourceLanguage = frame_source_language(FrameInfo),
     Line = [
         "{\"event\":\"return_from\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
@@ -337,7 +342,8 @@ write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, R
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(Arity), ",",
-        "\"return_value\":", json_term(ReturnValue),
+        "\"source_language\":", json_string(SourceLanguage), ",",
+        "\"return_value\":", json_term(ReturnValue, SourceLanguage),
         "}\n"
     ],
     ok = file:write(File, Line),
@@ -346,6 +352,7 @@ write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, R
 write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     {FrameInfo, State1} = pop_frame(Pid, State),
+    SourceLanguage = frame_source_language(FrameInfo),
     Line = [
         "{\"event\":\"exception_from\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
@@ -354,8 +361,9 @@ write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(Arity), ",",
+        "\"source_language\":", json_string(SourceLanguage), ",",
         "\"class\":", json_string(atom_to_list(Class)), ",",
-        "\"reason\":", json_term(Reason), ",",
+        "\"reason\":", json_term(Reason, SourceLanguage), ",",
         "\"reason_repr\":", json_string(io_lib:format("~0tp", [Reason])),
         "}\n"
     ],
@@ -467,6 +475,7 @@ write_trace_message(_File, _Message, _State) ->
 
 source_metadata(Module, Function, Arity, #state{manifest_index = ManifestIndex}) ->
     maps:get({Module, Function, Arity}, ManifestIndex, #{
+        source_language => "erlang",
         manifest_id => undefined,
         function_key => undefined,
         location_id => undefined,
@@ -484,9 +493,11 @@ push_frame(Pid, Metadata, State = #state{pid_frames = PidFrames, next_frame_id =
     PidText = pid_to_list(Pid),
     Stack = maps:get(PidText, PidFrames, []),
     FunctionKey = maps:get(function_key, Metadata, undefined),
+    SourceLanguage = maps:get(source_language, Metadata, "erlang"),
     Frame = #{
         frame_id => FrameId,
         function_key => FunctionKey,
+        source_language => SourceLanguage,
         variables => #{}
     },
     {FrameId, State#state{
@@ -507,6 +518,11 @@ frame_id(undefined) ->
     undefined;
 frame_id(Frame) ->
     maps:get(frame_id, Frame, undefined).
+
+frame_source_language(undefined) ->
+    "erlang";
+frame_source_language(Frame) ->
+    maps:get(source_language, Frame, "erlang").
 
 bind_variables(_File, _Pid, _ThreadId, [], State) ->
     State;
@@ -546,7 +562,8 @@ bind_variable(
                 runtime_variable_id => RuntimeVariableId,
                 slot => Slot,
                 slot_template => SlotTemplate,
-                name => Name
+                name => Name,
+                source_language => maps:get(source_language, Frame, "erlang")
             },
             Variables = maps:put(SlotTemplate, VariableInfo, Variables0),
             NewFrame = Frame#{variables => Variables},
@@ -554,7 +571,10 @@ bind_variable(
             ok = write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value),
             {NewFrame, NewState};
         VariableInfo0 ->
-            VariableInfo = VariableInfo0#{name => Name},
+            VariableInfo = VariableInfo0#{
+                name => Name,
+                source_language => maps:get(source_language, Frame, "erlang")
+            },
             Variables = maps:put(SlotTemplate, VariableInfo, Variables0),
             NewFrame = Frame#{variables => Variables},
             ok = write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value),
@@ -569,6 +589,7 @@ slot_template(FunctionKey, Slot) ->
     flatten_text(FunctionKey) ++ "#" ++ integer_to_list(Slot).
 
 write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value) ->
+    SourceLanguage = maps:get(source_language, VariableInfo, "erlang"),
     Line = [
         "{\"event\":\"variable_bind\",",
         "\"schema\":\"codetracer.beam.variable-binding.v1\",",
@@ -579,7 +600,8 @@ write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value) ->
         "\"slot\":", integer_to_list(maps:get(slot, VariableInfo)), ",",
         "\"slot_template\":", json_string(maps:get(slot_template, VariableInfo)), ",",
         "\"name\":", json_string(maps:get(name, VariableInfo)), ",",
-        "\"value\":", json_term(Value),
+        "\"source_language\":", json_string(SourceLanguage), ",",
+        "\"value\":", json_term(Value, SourceLanguage),
         "}\n"
     ],
     ok = file:write(File, Line).
@@ -789,6 +811,13 @@ join_json_terms([Value]) ->
 join_json_terms([Value | Rest]) ->
     [json_term(Value), ",", join_json_terms(Rest)].
 
+join_json_terms([], _SourceLanguage) ->
+    "";
+join_json_terms([Value], SourceLanguage) ->
+    json_term(Value, SourceLanguage);
+join_json_terms([Value | Rest], SourceLanguage) ->
+    [json_term(Value, SourceLanguage), ",", join_json_terms(Rest, SourceLanguage)].
+
 join_json([]) ->
     "";
 join_json([Value]) ->
@@ -796,16 +825,11 @@ join_json([Value]) ->
 join_json([Value | Rest]) ->
     [Value, ",", join_json(Rest)].
 
-json_term(Value) when is_integer(Value) ->
-    integer_to_list(Value);
-json_term(Value) when is_float(Value) ->
-    io_lib:format("~p", [Value]);
-json_term(true) ->
-    "true";
-json_term(false) ->
-    "false";
 json_term(Value) ->
-    json_string(io_lib:format("~0tp", [Value])).
+    json_term(Value, "erlang").
+
+json_term(Value, SourceLanguage) ->
+    codetracer_value_encoder:json(Value, SourceLanguage).
 
 json_nullable_string(undefined) ->
     "null";
