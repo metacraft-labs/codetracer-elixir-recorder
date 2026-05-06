@@ -463,10 +463,7 @@ impl RecordingSession {
     fn finish(&mut self, target_exit_code: i32) -> Result<(), RecorderDiagnostic> {
         let runtime_result = self.runtime.read_delivery()?;
         if runtime_result.delivered {
-            self.writer.register_thread_start(runtime_result.thread_id);
-            self.writer.register_thread_switch(runtime_result.thread_id);
             self.write_runtime_trace_events(&runtime_result)?;
-            self.writer.register_thread_exit(runtime_result.thread_id);
         }
         self.writer.register_special_event(
             EventLogKind::Write,
@@ -501,6 +498,15 @@ impl RecordingSession {
 
         for event in &runtime_result.trace_events {
             match event {
+                RuntimeTraceEvent::ThreadStart { thread_id, .. } => {
+                    self.writer.register_thread_start(*thread_id);
+                }
+                RuntimeTraceEvent::ThreadSwitch { thread_id, .. } => {
+                    self.writer.register_thread_switch(*thread_id);
+                }
+                RuntimeTraceEvent::ThreadExit { thread_id, .. } => {
+                    self.writer.register_thread_exit(*thread_id);
+                }
                 RuntimeTraceEvent::Call {
                     module,
                     function,
@@ -566,6 +572,16 @@ impl RecordingSession {
                         &payload.to_string(),
                     );
                 }
+                RuntimeTraceEvent::Message { payload } => {
+                    let content = serde_json::to_string(payload).map_err(|error| {
+                        RecorderDiagnostic::writer_finalization_failed(error.to_string())
+                    })?;
+                    self.writer.register_special_event(
+                        EventLogKind::TraceLogEvent,
+                        "beam_message",
+                        &content,
+                    );
+                }
             }
         }
 
@@ -599,7 +615,7 @@ struct CopiedSource {
 #[derive(Debug)]
 struct RuntimeDelivery {
     delivered: bool,
-    thread_id: u64,
+    root_thread_id: u64,
     root_pid: Option<String>,
     trace_events: Vec<RuntimeTraceEvent>,
 }
@@ -608,6 +624,7 @@ struct RuntimeDelivery {
 struct RuntimeSidecarEvent {
     event: String,
     thread_id: Option<u64>,
+    pid: Option<String>,
     root_pid: Option<String>,
     module: Option<String>,
     function: Option<String>,
@@ -617,6 +634,17 @@ struct RuntimeSidecarEvent {
     class: Option<String>,
     reason: Option<serde_json::Value>,
     reason_repr: Option<String>,
+    schema: Option<String>,
+    direction: Option<String>,
+    trace_tag: Option<String>,
+    tag: Option<String>,
+    sender_pid: Option<String>,
+    sender_thread_id: Option<u64>,
+    recipient_pid: Option<String>,
+    recipient_thread_id: Option<u64>,
+    message_format: Option<String>,
+    message_repr: Option<String>,
+    message_truncated: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -631,6 +659,15 @@ struct TraceFunctionSpec {
 
 #[derive(Clone, Debug)]
 enum RuntimeTraceEvent {
+    ThreadStart {
+        thread_id: u64,
+    },
+    ThreadSwitch {
+        thread_id: u64,
+    },
+    ThreadExit {
+        thread_id: u64,
+    },
     Call {
         module: String,
         function: String,
@@ -648,6 +685,24 @@ enum RuntimeTraceEvent {
         reason: serde_json::Value,
         reason_repr: String,
     },
+    Message {
+        payload: BeamMessagePayload,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BeamMessagePayload {
+    schema: String,
+    direction: String,
+    trace_tag: String,
+    tag: String,
+    sender_pid: Option<String>,
+    sender_thread_id: Option<u64>,
+    recipient_pid: Option<String>,
+    recipient_thread_id: Option<u64>,
+    message_format: String,
+    message_repr: String,
+    message_truncated: bool,
 }
 
 impl RuntimeSession {
@@ -782,7 +837,7 @@ impl RuntimeSession {
         if self.mode == RuntimeMode::NonBeam {
             return Ok(RuntimeDelivery {
                 delivered: false,
-                thread_id: RUNTIME_THREAD_ID,
+                root_thread_id: RUNTIME_THREAD_ID,
                 root_pid: None,
                 trace_events: Vec::new(),
             });
@@ -799,7 +854,7 @@ impl RuntimeSession {
         let mut saw_exit = false;
         let mut delivered = false;
         let mut root_pid = None;
-        let mut thread_id = RUNTIME_THREAD_ID;
+        let root_thread_id = RUNTIME_THREAD_ID;
         let mut trace_events = Vec::new();
 
         for (line_number, line) in text.lines().enumerate() {
@@ -811,17 +866,26 @@ impl RuntimeSession {
             })?;
             match event.event.as_str() {
                 "thread_start" => {
-                    saw_start = true;
-                    thread_id = event.thread_id.unwrap_or(RUNTIME_THREAD_ID);
-                    root_pid = event.root_pid;
+                    let thread_id = event.thread_id.unwrap_or(root_thread_id);
+                    if thread_id == root_thread_id {
+                        saw_start = true;
+                        root_pid = event.root_pid.clone().or(event.pid.clone());
+                    }
+                    trace_events.push(RuntimeTraceEvent::ThreadStart { thread_id });
                 }
                 "thread_switch" => {
-                    saw_switch = true;
-                    thread_id = event.thread_id.unwrap_or(thread_id);
+                    let thread_id = event.thread_id.unwrap_or(root_thread_id);
+                    if thread_id == root_thread_id {
+                        saw_switch = true;
+                    }
+                    trace_events.push(RuntimeTraceEvent::ThreadSwitch { thread_id });
                 }
                 "thread_exit" => {
-                    saw_exit = true;
-                    thread_id = event.thread_id.unwrap_or(thread_id);
+                    let thread_id = event.thread_id.unwrap_or(root_thread_id);
+                    if thread_id == root_thread_id {
+                        saw_exit = true;
+                    }
+                    trace_events.push(RuntimeTraceEvent::ThreadExit { thread_id });
                 }
                 "trace_delivered" => delivered = true,
                 "call" => {
@@ -847,6 +911,43 @@ impl RuntimeSession {
                         reason_repr: event.reason_repr.unwrap_or_default(),
                     });
                 }
+                "message_send" | "message_receive" => {
+                    trace_events.push(RuntimeTraceEvent::Message {
+                        payload: BeamMessagePayload {
+                            schema: event
+                                .schema
+                                .unwrap_or_else(|| "codetracer.beam.message.v1".to_string()),
+                            direction: require_optional_sidecar_string(
+                                event.direction,
+                                "direction",
+                                line_number + 1,
+                            )?,
+                            trace_tag: require_optional_sidecar_string(
+                                event.trace_tag,
+                                "trace_tag",
+                                line_number + 1,
+                            )?,
+                            tag: require_optional_sidecar_string(
+                                event.tag,
+                                "tag",
+                                line_number + 1,
+                            )?,
+                            sender_pid: event.sender_pid,
+                            sender_thread_id: event.sender_thread_id,
+                            recipient_pid: event.recipient_pid,
+                            recipient_thread_id: event.recipient_thread_id,
+                            message_format: event
+                                .message_format
+                                .unwrap_or_else(|| "erlang_external_text".to_string()),
+                            message_repr: require_optional_sidecar_string(
+                                event.message_repr,
+                                "message_repr",
+                                line_number + 1,
+                            )?,
+                            message_truncated: event.message_truncated.unwrap_or(false),
+                        },
+                    });
+                }
                 _ => {}
             }
         }
@@ -859,11 +960,23 @@ impl RuntimeSession {
 
         Ok(RuntimeDelivery {
             delivered,
-            thread_id,
+            root_thread_id,
             root_pid,
             trace_events,
         })
     }
+}
+
+fn require_optional_sidecar_string(
+    value: Option<String>,
+    field: &str,
+    line_number: usize,
+) -> Result<String, RecorderDiagnostic> {
+    value.ok_or_else(|| {
+        RecorderDiagnostic::writer_finalization_failed(format!(
+            "runtime sidecar line {line_number} missing required field {field}"
+        ))
+    })
 }
 
 fn require_sidecar_string(
@@ -1566,7 +1679,7 @@ fn write_trace_meta_json(
                 RuntimeMode::NonBeam => "non_beam",
             },
             delivered: runtime_result.delivered,
-            root_thread_id: runtime_result.thread_id,
+            root_thread_id: runtime_result.root_thread_id,
             root_pid: runtime_result.root_pid.clone(),
             sidecar: session.runtime.session_file.display().to_string(),
             source_root: session.runtime.source_root.display().to_string(),

@@ -101,6 +101,19 @@ fn compile_erlang_fixture(ebin_dir: &Path) {
     }
 }
 
+fn compile_erlang_spawn_fixture(ebin_dir: &Path) {
+    fs::create_dir_all(ebin_dir).expect("create spawn fixture ebin dir");
+    let source = repo_root().join("test-programs/erlang/spawn_messages/src/spawn_messages.erl");
+    let compile = Command::new("erlc")
+        .arg("+debug_info")
+        .arg("-o")
+        .arg(ebin_dir)
+        .arg(&source)
+        .output()
+        .expect("run erlc for spawn_messages");
+    assert_success(&compile, &format!("erlc {}", source.display()));
+}
+
 fn record_elixir_expression(label: &str, expression: &str) -> RecordedTrace {
     let tmp = temp_dir(label);
     let out_dir = tmp.join("trace");
@@ -130,8 +143,77 @@ fn record_elixir_expression(label: &str, expression: &str) -> RecordedTrace {
     RecordedTrace { out_dir, output }
 }
 
+fn record_elixir_fixture_expression(
+    label: &str,
+    fixture_name: &str,
+    expression: &str,
+) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let elixir_fixture = repo_root().join("test-programs/elixir").join(fixture_name);
+    let mix_build_root = tmp.join("mix-build");
+    compile_elixir_fixture(&elixir_fixture, &mix_build_root);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "mix",
+            "run",
+            "--no-compile",
+            "-e",
+            expression,
+        ])
+        .current_dir(&elixir_fixture)
+        .env("MIX_ENV", "test")
+        .env("MIX_BUILD_ROOT", &mix_build_root)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Elixir fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
+fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/spawn_messages");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_spawn_fixture(&ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "spawn_messages",
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Erlang spawn fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
 fn open_mix_trace(out_dir: &Path) -> NimTraceReaderHandle {
-    let ct_path = out_dir.join("mix.ct");
+    open_named_trace(out_dir, "mix.ct")
+}
+
+fn open_named_trace(out_dir: &Path, filename: &str) -> NimTraceReaderHandle {
+    let ct_path = out_dir.join(filename);
     assert!(
         ct_path.is_file(),
         "expected CTFS trace at {}",
@@ -291,6 +373,74 @@ fn decode_reader_event_content(event_json: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| event_json.to_string())
 }
 
+fn sidecar_message_events(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.get("event").and_then(Value::as_str),
+                Some("message_send" | "message_receive")
+            )
+        })
+        .collect()
+}
+
+fn find_message_event<'a>(messages: &'a [&'a Value], direction: &str, tag: &str) -> &'a Value {
+    messages
+        .iter()
+        .copied()
+        .find(|event| {
+            event["direction"] == direction
+                && event["tag"] == tag
+                && event["schema"] == "codetracer.beam.message.v1"
+        })
+        .unwrap_or_else(|| {
+            panic!("missing {direction} message with tag {tag}; messages={messages:#?}")
+        })
+}
+
+fn assert_reader_trace_log_contains(out_dir: &Path, trace_file: &str, tags: &[&str]) {
+    let reader = open_named_trace(out_dir, trace_file);
+    let event_payloads = (0..reader.event_count())
+        .map(|index| {
+            decode_reader_event_content(&reader.event_json(index).expect("read event json"))
+        })
+        .collect::<Vec<_>>();
+
+    for tag in tags {
+        assert!(
+            event_payloads.iter().any(|payload| {
+                payload.contains("codetracer.beam.message.v1")
+                    && payload.contains(&format!(r#""tag":"{tag}""#))
+            }),
+            "reader should expose TraceLogEvent payload for tag {tag}: {event_payloads:#?}"
+        );
+    }
+}
+
+fn sidecar_thread_ids(events: &[Value], event_name: &str) -> Vec<u64> {
+    events
+        .iter()
+        .filter(|event| event["event"] == event_name)
+        .filter_map(|event| event["thread_id"].as_u64())
+        .collect()
+}
+
+fn assert_reader_thread_event(out_dir: &Path, trace_file: &str, kind: &str, thread_id: u64) {
+    let reader = open_named_trace(out_dir, trace_file);
+    let expected_kind = format!(r#""kind":"{kind}""#);
+    let expected_thread = format!(r#""thread_id":{thread_id}"#);
+    let step_jsons = (0..reader.step_count())
+        .map(|index| reader.step_json(index).expect("read step json"))
+        .collect::<Vec<_>>();
+    assert!(
+        step_jsons
+            .iter()
+            .any(|json| json.contains(&expected_kind) && json.contains(&expected_thread)),
+        "missing reader thread event {kind} for thread {thread_id}: {step_jsons:#?}"
+    );
+}
+
 #[test]
 fn e2e_runtime_session_records_real_elixir_process() {
     let tmp = temp_dir("runtime-elixir");
@@ -424,6 +574,195 @@ fn e2e_runtime_records_real_exception_fixture() {
         }),
         "reader should expose exception_from as Error event with schema metadata: {event_jsons:#?}"
     );
+}
+
+#[test]
+fn e2e_runtime_records_elixir_task_messages() {
+    let recorded =
+        record_elixir_fixture_expression("m6-elixir-task", "task_messages", "TaskMessages.main()");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "task-ok\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    let messages = sidecar_message_events(&events);
+    let task_go_send = find_message_event(&messages, "send", "task_go");
+    let task_go_receive = find_message_event(&messages, "receive", "task_go");
+    let task_ready_send = find_message_event(&messages, "send", "task_ready");
+    let task_ready_receive = find_message_event(&messages, "receive", "task_ready");
+    let task_ack_send = find_message_event(&messages, "send", "task_ack");
+    let task_ack_receive = find_message_event(&messages, "receive", "task_ack");
+
+    assert_eq!(task_go_send["sender_thread_id"], 1);
+    assert_eq!(task_go_send["sender_pid"], task_go_receive["sender_pid"]);
+    assert_eq!(
+        task_go_send["recipient_pid"],
+        task_go_receive["recipient_pid"]
+    );
+    assert_eq!(
+        task_go_send["recipient_thread_id"],
+        task_go_receive["recipient_thread_id"]
+    );
+    assert_eq!(
+        task_ready_send["sender_thread_id"],
+        task_go_send["recipient_thread_id"]
+    );
+    assert_eq!(task_ready_send["recipient_thread_id"], 1);
+    assert_eq!(
+        task_ready_send["sender_pid"],
+        task_ready_receive["sender_pid"]
+    );
+    assert_eq!(
+        task_ack_send["recipient_thread_id"],
+        task_go_send["recipient_thread_id"]
+    );
+    assert_eq!(
+        task_ack_send["sender_thread_id"],
+        task_ack_receive["sender_thread_id"]
+    );
+    assert_eq!(task_ack_send["message_format"], "erlang_external_text");
+    assert_eq!(task_ack_send["message_truncated"], false);
+
+    let task_thread_id = task_go_send["recipient_thread_id"]
+        .as_u64()
+        .expect("task recipient thread id");
+    assert!(
+        sidecar_thread_ids(&events, "thread_start").contains(&task_thread_id),
+        "Task process should have a stable ThreadStart: {events:#?}"
+    );
+    assert!(
+        sidecar_thread_ids(&events, "thread_exit").contains(&task_thread_id),
+        "Task process should have a ThreadExit: {events:#?}"
+    );
+    assert!(
+        sidecar_thread_ids(&events, "thread_switch").contains(&task_thread_id)
+            && sidecar_thread_ids(&events, "thread_switch").contains(&1),
+        "message flow should switch between root and task threads: {events:#?}"
+    );
+
+    assert_reader_thread_event(&recorded.out_dir, "mix.ct", "thread_start", task_thread_id);
+    assert_reader_thread_event(&recorded.out_dir, "mix.ct", "thread_switch", task_thread_id);
+    assert_reader_thread_event(&recorded.out_dir, "mix.ct", "thread_exit", task_thread_id);
+    assert_reader_trace_log_contains(
+        &recorded.out_dir,
+        "mix.ct",
+        &["task_go", "task_ready", "task_ack"],
+    );
+}
+
+#[test]
+fn e2e_runtime_records_erlang_spawn_messages() {
+    let recorded = record_erlang_spawn_function("m6-erlang-spawn", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "spawn-ok\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    let messages = sidecar_message_events(&events);
+    let ping_send = find_message_event(&messages, "send", "spawn_ping");
+    let ping_receive = find_message_event(&messages, "receive", "spawn_ping");
+    let pong_send = find_message_event(&messages, "send", "spawn_pong");
+    let pong_receive = find_message_event(&messages, "receive", "spawn_pong");
+
+    assert_eq!(ping_send["sender_thread_id"], 1);
+    assert_eq!(ping_send["sender_pid"], ping_receive["sender_pid"]);
+    assert_eq!(ping_send["recipient_pid"], ping_receive["recipient_pid"]);
+    assert_eq!(
+        ping_send["recipient_thread_id"],
+        ping_receive["recipient_thread_id"]
+    );
+    assert_eq!(
+        pong_send["sender_thread_id"],
+        ping_send["recipient_thread_id"]
+    );
+    assert_eq!(pong_send["recipient_thread_id"], 1);
+    assert_eq!(pong_send["sender_pid"], pong_receive["sender_pid"]);
+    assert_eq!(pong_send["recipient_pid"], pong_receive["recipient_pid"]);
+
+    let child_thread_id = ping_send["recipient_thread_id"]
+        .as_u64()
+        .expect("spawn child recipient thread id");
+    assert!(
+        sidecar_thread_ids(&events, "thread_start").contains(&child_thread_id),
+        "spawned Erlang process should have ThreadStart: {events:#?}"
+    );
+    assert!(
+        sidecar_thread_ids(&events, "thread_exit").contains(&child_thread_id),
+        "spawned Erlang process should have ThreadExit: {events:#?}"
+    );
+    assert!(
+        sidecar_thread_ids(&events, "thread_switch").contains(&child_thread_id),
+        "spawned Erlang process should receive a ThreadSwitch: {events:#?}"
+    );
+
+    assert_reader_thread_event(&recorded.out_dir, "erl.ct", "thread_start", child_thread_id);
+    assert_reader_thread_event(
+        &recorded.out_dir,
+        "erl.ct",
+        "thread_switch",
+        child_thread_id,
+    );
+    assert_reader_thread_event(&recorded.out_dir, "erl.ct", "thread_exit", child_thread_id);
+    assert_reader_trace_log_contains(&recorded.out_dir, "erl.ct", &["spawn_ping", "spawn_pong"]);
+}
+
+#[test]
+fn e2e_runtime_trace_delivered_flush_barrier() {
+    let recorded = record_erlang_spawn_function("m6-flush-barrier", "flood");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "flush-ok\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "trace_delivered" && event["delivery_target"] == "all"
+        }),
+        "runtime sidecar should contain erlang:trace_delivered(all) barrier: {events:#?}"
+    );
+
+    let messages = sidecar_message_events(&events);
+    let flush_receives = messages
+        .iter()
+        .filter(|event| event["direction"] == "receive" && event["tag"] == "flush_ping")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flush_receives.len(),
+        64,
+        "every deterministic flood message should be received before final flush"
+    );
+    for index in 1..=64 {
+        let expected_repr = format!("{{flush_ping,{index}}}");
+        assert!(
+            flush_receives
+                .iter()
+                .any(|event| event["message_repr"] == expected_repr),
+            "missing received flood message {expected_repr}: {flush_receives:#?}"
+        );
+    }
+
+    assert_reader_trace_log_contains(&recorded.out_dir, "erl.ct", &["flush_ping", "flush_done"]);
 }
 
 #[test]

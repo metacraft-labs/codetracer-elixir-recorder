@@ -12,6 +12,10 @@
     session_file = undefined,
     root_pid = undefined,
     root_thread_id = 1,
+    pid_threads = #{},
+    next_thread_id = 2,
+    last_thread_id = undefined,
+    exited_pids = #{},
     source_paths = [],
     trace_functions = [],
     started = false
@@ -49,7 +53,8 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
     ThreadId = 1,
     RootPidText = pid_to_list(RootPid),
     ok = install_trace_patterns(TraceFunctions),
-    erlang:trace(RootPid, true, [call, {tracer, self()}]),
+    ok = install_message_trace_patterns(),
+    erlang:trace(RootPid, true, [call, procs, send, 'receive', set_on_spawn, {tracer, self()}]),
     ok = write_thread_event(File, "thread_start", ThreadId, RootPidText, SourcePaths),
     ok = write_thread_event(File, "thread_switch", ThreadId, RootPidText, SourcePaths),
     {reply, {ok, ThreadId}, State#state{
@@ -57,22 +62,26 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
         session_file = SessionFile,
         root_pid = RootPidText,
         root_thread_id = ThreadId,
+        pid_threads = #{RootPidText => ThreadId},
+        next_thread_id = 2,
+        last_thread_id = ThreadId,
         source_paths = SourcePaths,
         trace_functions = TraceFunctions,
         started = true
     }};
 handle_call({stop_session, Reason}, _From, State = #state{started = true, file = File}) ->
-    ok = disable_root_trace(State),
+    DeliveryRef = flush_trace_delivery(),
+    StateAfterDrain = drain_trace_messages(File, State),
+    ok = disable_traces(StateAfterDrain),
+    ok = clear_message_trace_patterns(),
+    ok = clear_trace_patterns(StateAfterDrain#state.trace_functions),
     ok = write_thread_event(
         File,
         "thread_exit",
-        State#state.root_thread_id,
-        State#state.root_pid,
-        State#state.source_paths
+        StateAfterDrain#state.root_thread_id,
+        StateAfterDrain#state.root_pid,
+        StateAfterDrain#state.source_paths
     ),
-    DeliveryRef = flush_trace_delivery(),
-    ok = drain_trace_messages(File),
-    ok = clear_trace_patterns(State#state.trace_functions),
     ok = write_delivered(File, Reason, DeliveryRef),
     ok = file:sync(File),
     ok = file:close(File),
@@ -84,8 +93,8 @@ handle_cast(_Message, State) ->
     {noreply, State}.
 
 handle_info(Message, State = #state{started = true, file = File}) ->
-    case write_trace_message(File, Message) of
-        ok -> {noreply, State};
+    case write_trace_message(File, Message, State) of
+        {ok, NewState} -> {noreply, NewState};
         ignore -> {noreply, State}
     end;
 handle_info(_Message, State) ->
@@ -117,6 +126,16 @@ install_trace_patterns(TraceFunctions) ->
     ),
     ok.
 
+install_message_trace_patterns() ->
+    _ = erlang:trace_pattern(send, true, []),
+    _ = erlang:trace_pattern('receive', [{['_', '$1', '_'], [], [{message, '$1'}]}], []),
+    ok.
+
+clear_message_trace_patterns() ->
+    _ = erlang:trace_pattern(send, false, []),
+    _ = erlang:trace_pattern('receive', false, []),
+    ok.
+
 clear_trace_patterns(TraceFunctions) ->
     lists:foreach(
         fun({Module, Function, Arity, _Kind, _SourcePath, _Line}) ->
@@ -126,16 +145,20 @@ clear_trace_patterns(TraceFunctions) ->
     ),
     ok.
 
-disable_root_trace(#state{root_pid = undefined}) ->
-    ok;
-disable_root_trace(#state{root_pid = RootPidText}) ->
-    case list_to_pid_safe(RootPidText) of
-        {ok, RootPid} ->
-            erlang:trace(RootPid, false, [call]),
-            ok;
-        error ->
-            ok
-    end.
+disable_traces(#state{pid_threads = PidThreads}) ->
+    maps:fold(
+        fun(PidText, _ThreadId, ok) ->
+            case list_to_pid_safe(PidText) of
+                {ok, Pid} ->
+                    _ = catch erlang:trace(Pid, false, [call, procs, send, 'receive', set_on_spawn]),
+                    ok;
+                error ->
+                    ok
+            end
+        end,
+        ok,
+        PidThreads
+    ).
 
 list_to_pid_safe(Text) ->
     try {ok, list_to_pid(Text)}
@@ -150,41 +173,53 @@ flush_trace_delivery() ->
             Ref
     end.
 
-drain_trace_messages(File) ->
+drain_trace_messages(File, State) ->
     receive
         Message ->
-            _ = write_trace_message(File, Message),
-            drain_trace_messages(File)
+            NewState =
+                case write_trace_message(File, Message, State) of
+                    {ok, UpdatedState} -> UpdatedState;
+                    ignore -> State
+                end,
+            drain_trace_messages(File, NewState)
     after 0 ->
-        ok
+        State
     end.
 
-write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}) ->
+write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
+    {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     Line = [
         "{\"event\":\"call\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(length(Args)), ",",
         "\"args\":[", join_json_terms(Args), "]",
         "}\n"
     ],
-    ok = file:write(File, Line);
-write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}) ->
+    ok = file:write(File, Line),
+    {ok, State};
+write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
+    {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     Line = [
         "{\"event\":\"return_from\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(Arity), ",",
         "\"return_value\":", json_term(ReturnValue),
         "}\n"
     ],
-    ok = file:write(File, Line);
-write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}) ->
+    ok = file:write(File, Line),
+    {ok, State};
+write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
+    {ThreadId, State} = ensure_event_thread(File, Pid, State0),
     Line = [
         "{\"event\":\"exception_from\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(Arity), ",",
@@ -193,14 +228,116 @@ write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}
         "\"reason_repr\":", json_string(io_lib:format("~0tp", [Reason])),
         "}\n"
     ],
-    ok = file:write(File, Line);
-write_trace_message(_File, _Message) ->
+    ok = file:write(File, Line),
+    {ok, State};
+write_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
+    {_ParentThreadId, State1} = ensure_event_thread(File, Pid, State0),
+    {_ChildThreadId, State} = ensure_pid_thread(File, ChildPid, State1),
+    Line = [
+        "{\"event\":\"process_spawn\",",
+        "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"child_pid\":", json_string(pid_to_list(ChildPid)), ",",
+        "\"module\":", json_string(atom_to_list(Module)), ",",
+        "\"function\":", json_string(atom_to_list(Function)), ",",
+        "\"arity\":", integer_to_list(length(Args)),
+        "}\n"
+    ],
+    ok = file:write(File, Line),
+    {ok, State};
+write_trace_message(File, {trace, Pid, spawned, ParentPid, {Module, Function, Args}}, State0) ->
+    {ThreadId, State} = ensure_event_thread(File, Pid, State0),
+    Line = [
+        "{\"event\":\"process_spawned\",",
+        "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"parent_pid\":", json_string(pid_to_list(ParentPid)), ",",
+        "\"module\":", json_string(atom_to_list(Module)), ",",
+        "\"function\":", json_string(atom_to_list(Function)), ",",
+        "\"arity\":", integer_to_list(length(Args)),
+        "}\n"
+    ],
+    ok = file:write(File, Line),
+    {ok, State};
+write_trace_message(File, {trace, Pid, exit, Reason}, State0) ->
+    {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
+    PidText = pid_to_list(Pid),
+    case maps:is_key(PidText, State1#state.exited_pids) of
+        true ->
+            {ok, State1};
+        false ->
+            Line = [
+                "{\"event\":\"thread_exit\",",
+                "\"pid\":", json_string(PidText), ",",
+                "\"root_pid\":", json_string(PidText), ",",
+                "\"thread_id\":", integer_to_list(ThreadId), ",",
+                "\"reason\":", json_term(Reason),
+                "}\n"
+            ],
+            ok = file:write(File, Line),
+            {ok, State1#state{exited_pids = maps:put(PidText, true, State1#state.exited_pids)}}
+    end;
+write_trace_message(File, {trace, Pid, send, Message, Recipient}, State0) ->
+    {SenderThreadId, State1} = ensure_event_thread(File, Pid, State0),
+    {RecipientPidText, RecipientThreadId, State} = recipient_thread(File, Recipient, State1),
+    ok = write_message_event(
+        File,
+        "message_send",
+        "send",
+        Pid,
+        SenderThreadId,
+        RecipientPidText,
+        RecipientThreadId,
+        Message
+    ),
+    {ok, State};
+write_trace_message(File, {trace, Pid, send_to_non_existing_process, Message, Recipient}, State0) ->
+    {SenderThreadId, State} = ensure_event_thread(File, Pid, State0),
+    ok = write_message_event(
+        File,
+        "message_send",
+        "send_to_non_existing_process",
+        Pid,
+        SenderThreadId,
+        recipient_text(Recipient),
+        undefined,
+        Message
+    ),
+    {ok, State};
+write_trace_message(File, {trace, Pid, 'receive', Message, Sender}, State0) ->
+    {RecipientThreadId, State1} = ensure_event_thread(File, Pid, State0),
+    {SenderPidText, SenderThreadId, State} = sender_thread(File, Sender, State1),
+    ok = write_message_event(
+        File,
+        "message_receive",
+        "receive",
+        SenderPidText,
+        SenderThreadId,
+        pid_to_list(Pid),
+        RecipientThreadId,
+        Message
+    ),
+    {ok, State};
+write_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
+    {RecipientThreadId, State} = ensure_event_thread(File, Pid, State0),
+    ok = write_message_event(
+        File,
+        "message_receive",
+        "receive",
+        undefined,
+        undefined,
+        pid_to_list(Pid),
+        RecipientThreadId,
+        Message
+    ),
+    {ok, State};
+write_trace_message(_File, _Message, _State) ->
     ignore.
 
 write_thread_event(File, Event, ThreadId, RootPid, SourcePaths) ->
     Line = [
         "{\"event\":\"", Event, "\",",
         "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"pid\":", json_string(RootPid), ",",
         "\"root_pid\":", json_string(RootPid), ",",
         "\"source_paths\":[", join_json_strings(SourcePaths), "]",
         "}\n"
@@ -216,6 +353,131 @@ write_delivered(File, Reason, DeliveryRef) ->
         "}\n"
     ],
     ok = file:write(File, Line).
+
+ensure_event_thread(File, Pid, State0) ->
+    {ThreadId, State1} = ensure_pid_thread(File, Pid, State0),
+    case State1#state.last_thread_id of
+        ThreadId ->
+            {ThreadId, State1};
+        _ ->
+            ok = write_thread_event(
+                File,
+                "thread_switch",
+                ThreadId,
+                pid_to_list(Pid),
+                State1#state.source_paths
+            ),
+            {ThreadId, State1#state{last_thread_id = ThreadId}}
+    end.
+
+ensure_pid_thread(File, Pid, State = #state{pid_threads = PidThreads}) when is_pid(Pid) ->
+    PidText = pid_to_list(Pid),
+    case maps:get(PidText, PidThreads, undefined) of
+        undefined ->
+            ThreadId = State#state.next_thread_id,
+            ok = write_thread_event(File, "thread_start", ThreadId, PidText, State#state.source_paths),
+            {ThreadId, State#state{
+                pid_threads = maps:put(PidText, ThreadId, PidThreads),
+                next_thread_id = ThreadId + 1
+            }};
+        ThreadId ->
+            {ThreadId, State}
+    end.
+
+recipient_thread(File, Recipient, State) when is_pid(Recipient) ->
+    {ThreadId, NewState} = ensure_pid_thread(File, Recipient, State),
+    {pid_to_list(Recipient), ThreadId, NewState};
+recipient_thread(_File, Recipient, State) ->
+    {recipient_text(Recipient), undefined, State}.
+
+sender_thread(File, Sender, State) when is_pid(Sender) ->
+    {ThreadId, NewState} = ensure_pid_thread(File, Sender, State),
+    {pid_to_list(Sender), ThreadId, NewState};
+sender_thread(_File, Sender, State) ->
+    {sender_text(Sender), undefined, State}.
+
+recipient_text(undefined) ->
+    undefined;
+recipient_text(Recipient) when is_pid(Recipient) ->
+    pid_to_list(Recipient);
+recipient_text(Recipient) ->
+    io_lib:format("~0tp", [Recipient]).
+
+sender_text(undefined) ->
+    undefined;
+sender_text(Sender) when is_pid(Sender) ->
+    pid_to_list(Sender);
+sender_text(Sender) ->
+    io_lib:format("~0tp", [Sender]).
+
+write_message_event(
+    File,
+    Event,
+    TraceTag,
+    SenderPid,
+    SenderThreadId,
+    RecipientPid,
+    RecipientThreadId,
+    Message
+) ->
+    {MessageRepr, MessageTruncated} = bounded_term(Message, 512),
+    Line = [
+        "{\"event\":\"", Event, "\",",
+        "\"schema\":\"codetracer.beam.message.v1\",",
+        "\"direction\":", json_string(message_direction(Event)), ",",
+        "\"trace_tag\":", json_string(TraceTag), ",",
+        "\"tag\":", json_string(message_tag(Message)), ",",
+        "\"sender_pid\":", json_nullable_string(pid_text(SenderPid)), ",",
+        "\"sender_thread_id\":", json_nullable_integer(SenderThreadId), ",",
+        "\"recipient_pid\":", json_nullable_string(pid_text(RecipientPid)), ",",
+        "\"recipient_thread_id\":", json_nullable_integer(RecipientThreadId), ",",
+        "\"message_format\":\"erlang_external_text\",",
+        "\"message_repr\":", json_string(MessageRepr), ",",
+        "\"message_truncated\":", json_boolean(MessageTruncated),
+        "}\n"
+    ],
+    ok = file:write(File, Line).
+
+message_direction("message_send") ->
+    "send";
+message_direction("message_receive") ->
+    "receive".
+
+pid_text(undefined) ->
+    undefined;
+pid_text(Pid) when is_pid(Pid) ->
+    pid_to_list(Pid);
+pid_text(Text) ->
+    Text.
+
+message_tag(Message) when is_tuple(Message), tuple_size(Message) > 0 ->
+    tag_text(element(1, Message));
+message_tag(Message) ->
+    tag_text(Message).
+
+tag_text(Value) when is_atom(Value) ->
+    atom_to_list(Value);
+tag_text(Value) when is_integer(Value) ->
+    "integer";
+tag_text(Value) when is_binary(Value) ->
+    "binary";
+tag_text(Value) when is_list(Value) ->
+    "list";
+tag_text(Value) when is_tuple(Value) ->
+    "tuple";
+tag_text(Value) when is_pid(Value) ->
+    "pid";
+tag_text(_Value) ->
+    "term".
+
+bounded_term(Value, Limit) ->
+    Text = lists:flatten(io_lib:format("~0tp", [Value])),
+    case length(Text) > Limit of
+        true ->
+            {string:substr(Text, 1, Limit), true};
+        false ->
+            {Text, false}
+    end.
 
 join_json_strings([]) ->
     "";
@@ -241,6 +503,21 @@ json_term(false) ->
     "false";
 json_term(Value) ->
     json_string(io_lib:format("~0tp", [Value])).
+
+json_nullable_string(undefined) ->
+    "null";
+json_nullable_string(Value) ->
+    json_string(Value).
+
+json_nullable_integer(undefined) ->
+    "null";
+json_nullable_integer(Value) ->
+    integer_to_list(Value).
+
+json_boolean(true) ->
+    "true";
+json_boolean(false) ->
+    "false".
 
 json_string(Value) ->
     [$", escape_json(flatten_text(Value)), $"].
