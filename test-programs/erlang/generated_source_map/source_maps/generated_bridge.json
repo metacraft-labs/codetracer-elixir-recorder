@@ -1,0 +1,22 @@
+{
+  "schema": "codetracer.beam.sourcemap.v1",
+  "source_language": "elixir",
+  "generated_path": "src/generated_bridge.erl",
+  "original_path": "lib/original_generated.ex",
+  "mappings": [
+    {
+      "generated_line": 4,
+      "generated_column": null,
+      "original_line": 4,
+      "original_column": null,
+      "reason": "generated function body maps to original Elixir compute/0"
+    },
+    {
+      "generated_line": 9,
+      "generated_column": null,
+      "original_line": 10,
+      "original_column": null,
+      "reason": "generated function body maps to original Elixir main/0"
+    }
+  ]
+}

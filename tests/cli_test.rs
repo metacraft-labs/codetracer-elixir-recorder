@@ -114,6 +114,20 @@ fn compile_erlang_spawn_fixture(ebin_dir: &Path) {
     assert_success(&compile, &format!("erlc {}", source.display()));
 }
 
+fn compile_erlang_generated_source_map_fixture(ebin_dir: &Path) {
+    fs::create_dir_all(ebin_dir).expect("create generated source-map fixture ebin dir");
+    let source =
+        repo_root().join("test-programs/erlang/generated_source_map/src/generated_bridge.erl");
+    let compile = Command::new("erlc")
+        .arg("+debug_info")
+        .arg("-o")
+        .arg(ebin_dir)
+        .arg(&source)
+        .output()
+        .expect("run erlc for generated_bridge");
+    assert_success(&compile, &format!("erlc {}", source.display()));
+}
+
 fn record_elixir_expression(label: &str, expression: &str) -> RecordedTrace {
     let tmp = temp_dir(label);
     let out_dir = tmp.join("trace");
@@ -208,6 +222,38 @@ fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
     RecordedTrace { out_dir, output }
 }
 
+fn record_erlang_generated_source_map_function(label: &str, function: &str) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/generated_source_map");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_generated_source_map_fixture(&ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "generated_bridge",
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run generated source-map fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
 fn open_mix_trace(out_dir: &Path) -> NimTraceReaderHandle {
     open_named_trace(out_dir, "mix.ct")
 }
@@ -230,6 +276,30 @@ fn runtime_sidecar_events(out_dir: &Path) -> Vec<Value> {
     sidecar
         .lines()
         .map(|line| serde_json::from_str(line).expect("runtime sidecar JSON line"))
+        .collect()
+}
+
+fn trace_meta(out_dir: &Path) -> Value {
+    let path = out_dir.join("trace_meta.json");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str(&text).expect("trace_meta.json")
+}
+
+fn manifest_jsons(out_dir: &Path) -> Vec<Value> {
+    let root = out_dir.join("recorder_metadata/manifests");
+    let mut paths = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        .map(|entry| entry.expect("manifest entry").path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            serde_json::from_str(&text).expect("manifest JSON")
+        })
         .collect()
 }
 
@@ -763,6 +833,277 @@ fn e2e_runtime_trace_delivered_flush_barrier() {
     }
 
     assert_reader_trace_log_contains(&recorded.out_dir, "erl.ct", &["flush_ping", "flush_done"]);
+}
+
+#[test]
+fn e2e_manifest_loaded_by_runtime_session() {
+    let recorded = record_elixir_expression("m7-manifest-loaded", "CanonicalFlow.identity(42)");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let canonical_manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.CanonicalFlow")
+        .unwrap_or_else(|| panic!("missing CanonicalFlow manifest: {manifests:#?}"));
+    assert_eq!(
+        canonical_manifest["schema"],
+        "codetracer.beam.module-manifest.v1"
+    );
+    assert_eq!(canonical_manifest["encoding"], "json");
+    assert!(
+        canonical_manifest["functions"]
+            .as_array()
+            .is_some_and(|functions| functions.iter().any(|function| {
+                function["key"] == "Elixir.CanonicalFlow.identity/1"
+                    && function["location_id"].as_u64().is_some()
+            })),
+        "manifest should define identity/1 function keys and location IDs: {canonical_manifest:#?}"
+    );
+    assert!(
+        canonical_manifest["variable_slot_templates"]
+            .as_array()
+            .is_some_and(|slots| slots.iter().any(|slot| {
+                slot["function_key"] == "Elixir.CanonicalFlow.identity/1" && slot["name"] == "_arg0"
+            })),
+        "manifest should define runtime argument slot templates: {canonical_manifest:#?}"
+    );
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["manifests"].as_array().is_some_and(|manifests| {
+            manifests.iter().any(|manifest| {
+                manifest["module"] == "Elixir.CanonicalFlow"
+                    && manifest["trace_copy_path"]
+                        == "recorder_metadata/manifests/Elixir.CanonicalFlow.manifest.json"
+            })
+        }),
+        "trace metadata should expose manifest bundle paths relative to recorder metadata: {meta:#?}"
+    );
+    assert!(
+        recorded
+            .out_dir
+            .join("recorder_metadata/manifests/Elixir.CanonicalFlow.manifest.json")
+            .is_file(),
+        "trace bundle should contain the CanonicalFlow manifest artifact"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    let manifest_loaded = events
+        .iter()
+        .find(|event| event["event"] == "manifest_loaded")
+        .unwrap_or_else(|| panic!("missing runtime manifest_loaded event: {events:#?}"));
+    assert_eq!(manifest_loaded["encoding"], "json");
+    assert!(
+        manifest_loaded["manifest_count"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1,
+        "runtime should load real manifest files: {manifest_loaded:#?}"
+    );
+    assert!(
+        manifest_loaded["manifest_paths"]
+            .as_array()
+            .is_some_and(|paths| paths.iter().all(|path| {
+                path.as_str().is_some_and(|path| {
+                    Path::new(path).is_absolute()
+                        && path.ends_with(".manifest.json")
+                        && Path::new(path).is_file()
+                })
+            })),
+        "runtime should load manifests from real absolute filesystem paths: {manifest_loaded:#?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.CanonicalFlow"
+                && event["function"] == "identity"
+                && event["manifest_id"] == "beam-manifest-v1:Elixir.CanonicalFlow"
+                && event["function_key"] == "Elixir.CanonicalFlow.identity/1"
+                && event["location_id"].as_u64().is_some()
+                && event["clause_id"].as_u64().is_some()
+        }),
+        "runtime call events should resolve through manifest IDs: {events:#?}"
+    );
+}
+
+#[test]
+fn e2e_source_location_resolution_real_files() {
+    let elixir = record_elixir_expression("m7-source-elixir", "CanonicalFlow.compute()");
+    assert_eq!(
+        elixir.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&elixir.output)
+    );
+    let elixir_meta = trace_meta(&elixir.out_dir);
+    assert_eq!(
+        elixir_meta["metadata_contract"]["source_location_resolver_order"],
+        serde_json::json!([
+            "source_map",
+            "erl_anno",
+            "module_file_fallback",
+            "unknown_generated_fallback"
+        ])
+    );
+    assert!(
+        elixir_meta["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["build_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("lib/canonical_flow.ex"))
+                    && source["trace_copy_path"] == "files/lib/canonical_flow.ex"
+            })
+        }),
+        "Elixir source should be normalized to build and trace-copy paths: {elixir_meta:#?}"
+    );
+    assert!(
+        elixir.out_dir.join("files/lib/canonical_flow.ex").is_file(),
+        "trace bundle should contain project-relative Elixir source copy"
+    );
+
+    let erlang = {
+        let tmp = temp_dir("m7-source-erlang");
+        let out_dir = tmp.join("trace");
+        let fixture_dir = repo_root().join("test-programs/erlang/canonical_flow");
+        let ebin_dir = tmp.join("erlang-ebin");
+        compile_erlang_fixture(&ebin_dir);
+        let output = clean_recorder_command()
+            .args([
+                "record",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--",
+                "erl",
+                "-noshell",
+                "-pa",
+                ebin_dir.to_str().unwrap(),
+                "-s",
+                "canonical_flow",
+                "main",
+                "-s",
+                "init",
+                "stop",
+            ])
+            .current_dir(&fixture_dir)
+            .env("TMPDIR", tmp.to_str().unwrap())
+            .output()
+            .expect("run Erlang fixture under runtime session");
+        RecordedTrace { out_dir, output }
+    };
+    assert_eq!(
+        erlang.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&erlang.output)
+    );
+    assert!(
+        erlang
+            .out_dir
+            .join("files/src/canonical_flow.erl")
+            .is_file(),
+        "trace bundle should contain project-relative Erlang source copy"
+    );
+
+    let reader = open_named_trace(&erlang.out_dir, "erl.ct");
+    let function_names = reader_function_names(&reader);
+    assert!(
+        function_names
+            .iter()
+            .any(|name| name == "canonical_flow:main/0"),
+        "reader should expose real Erlang source metadata through function records: {function_names:#?}"
+    );
+}
+
+#[test]
+fn e2e_source_map_sparse_override_real_trace() {
+    let recorded = record_erlang_generated_source_map_function("m7-source-map", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "mapped-ok:42\n"
+    );
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["source_maps"].as_array().is_some_and(|maps| {
+            maps.iter().any(|map| {
+                map["generated_build_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("src/generated_bridge.erl"))
+                    && map["original_build_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("lib/original_generated.ex"))
+                    && map["trace_copy_path"]
+                        == "recorder_metadata/source_maps/001-src_generated_bridge.erl.json"
+            })
+        }),
+        "trace metadata should list copied sparse source-map artifact: {meta:#?}"
+    );
+    assert!(
+        recorded
+            .out_dir
+            .join("recorder_metadata/source_maps/001-src_generated_bridge.erl.json")
+            .is_file(),
+        "trace bundle should contain copied sparse source-map artifact"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let generated_manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "generated_bridge")
+        .unwrap_or_else(|| panic!("missing generated_bridge manifest: {manifests:#?}"));
+    assert!(
+        generated_manifest["source_maps"]
+            .as_array()
+            .is_some_and(|paths| paths.iter().any(|path| {
+                path == "recorder_metadata/source_maps/001-src_generated_bridge.erl.json"
+            })),
+        "module manifest should reference bundle-relative source-map artifacts: {generated_manifest:#?}"
+    );
+    assert!(
+        generated_manifest["locations"]
+            .as_array()
+            .is_some_and(|locations| locations.iter().any(|location| {
+                location["resolution"] == "source_map"
+                    && location["trace_copy_path"] == "files/lib/original_generated.ex"
+                    && location["build_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("lib/original_generated.ex"))
+            })),
+        "generated Erlang manifest locations should prefer sparse source-map overrides: {generated_manifest:#?}"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "generated_bridge"
+                && event["source_location"]["resolution"] == "source_map"
+                && event["source_location"]["trace_copy_path"] == "files/lib/original_generated.ex"
+        }),
+        "runtime call events should carry source-map-resolved source locations: {events:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("lib/original_generated.ex")),
+        "reader/raw CTFS-visible paths should include original source from source-map resolution: {paths:#?}"
+    );
 }
 
 #[test]

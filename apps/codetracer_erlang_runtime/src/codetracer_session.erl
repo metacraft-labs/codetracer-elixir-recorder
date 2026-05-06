@@ -17,6 +17,8 @@
     last_thread_id = undefined,
     exited_pids = #{},
     source_paths = [],
+    manifest_paths = [],
+    manifest_index = #{},
     trace_functions = [],
     started = false
 }).
@@ -47,11 +49,17 @@ handle_call({start_session, _Options}, _From, State = #state{started = true}) ->
 handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
     SessionFile = require_option(session_file, Options),
     SourcePaths = proplists:get_value(source_paths, Options, []),
+    ManifestPaths = proplists:get_value(manifest_paths, Options, []),
     TraceFunctions = proplists:get_value(trace_functions, Options, []),
     ok = filelib:ensure_dir(SessionFile),
     {ok, File} = file:open(SessionFile, [write, {encoding, utf8}]),
     ThreadId = 1,
     RootPidText = pid_to_list(RootPid),
+    ManifestIndex = build_manifest_index(TraceFunctions),
+    {ok, LoadedManifests} = load_manifests(ManifestPaths),
+    persistent_term:put({codetracer_elixir_recorder, manifests}, LoadedManifests),
+    persistent_term:put({codetracer_elixir_recorder, manifest_index}, ManifestIndex),
+    ok = write_manifest_loaded(File, ManifestPaths, LoadedManifests),
     ok = install_trace_patterns(TraceFunctions),
     ok = install_message_trace_patterns(),
     erlang:trace(RootPid, true, [call, procs, send, 'receive', set_on_spawn, {tracer, self()}]),
@@ -66,6 +74,8 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
         next_thread_id = 2,
         last_thread_id = ThreadId,
         source_paths = SourcePaths,
+        manifest_paths = ManifestPaths,
+        manifest_index = ManifestIndex,
         trace_functions = TraceFunctions,
         started = true
     }};
@@ -75,6 +85,8 @@ handle_call({stop_session, Reason}, _From, State = #state{started = true, file =
     ok = disable_traces(StateAfterDrain),
     ok = clear_message_trace_patterns(),
     ok = clear_trace_patterns(StateAfterDrain#state.trace_functions),
+    persistent_term:erase({codetracer_elixir_recorder, manifests}),
+    persistent_term:erase({codetracer_elixir_recorder, manifest_index}),
     ok = write_thread_event(
         File,
         "thread_exit",
@@ -115,10 +127,78 @@ require_option(Key, Options) ->
         Value -> Value
     end.
 
+trace_function_mfa({Module, Function, Arity, _Kind, _SourcePath, _Line}) ->
+    {Module, Function, Arity};
+trace_function_mfa({Module, Function, Arity, _Kind, _SourcePath, _Line, _ManifestId, _FunctionKey, _LocationId, _ClauseId, _ResolvedSourcePath, _ResolvedLine, _ResolvedColumn, _ResolutionStrategy, _TraceCopyPath}) ->
+    {Module, Function, Arity}.
+
+build_manifest_index(TraceFunctions) ->
+    lists:foldl(
+        fun(FunctionSpec, Acc) ->
+            {Module, Function, Arity} = trace_function_mfa(FunctionSpec),
+            maps:put({Module, Function, Arity}, trace_function_metadata(FunctionSpec), Acc)
+        end,
+        #{},
+        TraceFunctions
+    ).
+
+trace_function_metadata({_Module, _Function, _Arity, _Kind, SourcePath, Line}) ->
+    #{
+        manifest_id => undefined,
+        function_key => undefined,
+        location_id => undefined,
+        clause_id => undefined,
+        source_location => #{
+            build_path => SourcePath,
+            trace_copy_path => SourcePath,
+            line => Line,
+            column => undefined,
+            resolution => "erl_anno"
+        }
+    };
+trace_function_metadata({_Module, _Function, _Arity, _Kind, _SourcePath, _Line, ManifestId, FunctionKey, LocationId, ClauseId, ResolvedSourcePath, ResolvedLine, ResolvedColumn, ResolutionStrategy, TraceCopyPath}) ->
+    #{
+        manifest_id => ManifestId,
+        function_key => FunctionKey,
+        location_id => LocationId,
+        clause_id => ClauseId,
+        source_location => #{
+            build_path => ResolvedSourcePath,
+            trace_copy_path => TraceCopyPath,
+            line => ResolvedLine,
+            column => ResolvedColumn,
+            resolution => ResolutionStrategy
+        }
+    }.
+
+load_manifests(ManifestPaths) ->
+    Loaded =
+        lists:map(
+            fun(Path) ->
+                {ok, Binary} = file:read_file(Path),
+                #{path => Path, encoding => "json", bytes => byte_size(Binary), json => Binary}
+            end,
+            ManifestPaths
+        ),
+    {ok, Loaded}.
+
+write_manifest_loaded(File, ManifestPaths, LoadedManifests) ->
+    Line = [
+        "{\"event\":\"manifest_loaded\",",
+        "\"schema\":\"codetracer.beam.module-manifest.v1\",",
+        "\"encoding\":\"json\",",
+        "\"persistent_term_key\":\"{codetracer_elixir_recorder,manifests}\",",
+        "\"manifest_count\":", integer_to_list(length(LoadedManifests)), ",",
+        "\"manifest_paths\":[", join_json_strings(ManifestPaths), "]",
+        "}\n"
+    ],
+    ok = file:write(File, Line).
+
 install_trace_patterns(TraceFunctions) ->
     MatchSpec = [{'_', [], [{return_trace}, {exception_trace}]}],
     lists:foreach(
-        fun({Module, Function, Arity, _Kind, _SourcePath, _Line}) ->
+        fun(FunctionSpec) ->
+            {Module, Function, Arity} = trace_function_mfa(FunctionSpec),
             _ = code:ensure_loaded(Module),
             _ = erlang:trace_pattern({Module, Function, Arity}, MatchSpec, [local])
         end,
@@ -138,7 +218,8 @@ clear_message_trace_patterns() ->
 
 clear_trace_patterns(TraceFunctions) ->
     lists:foreach(
-        fun({Module, Function, Arity, _Kind, _SourcePath, _Line}) ->
+        fun(FunctionSpec) ->
+            {Module, Function, Arity} = trace_function_mfa(FunctionSpec),
             _ = erlang:trace_pattern({Module, Function, Arity}, false, [local])
         end,
         TraceFunctions
@@ -188,6 +269,7 @@ drain_trace_messages(File, State) ->
 
 write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
+    Metadata = source_metadata(Module, Function, length(Args), State),
     Line = [
         "{\"event\":\"call\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
@@ -195,6 +277,7 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(length(Args)), ",",
+        source_metadata_json(Metadata), ",",
         "\"args\":[", join_json_terms(Args), "]",
         "}\n"
     ],
@@ -332,6 +415,37 @@ write_trace_message(File, {trace, Pid, 'receive', Message}, State0) ->
     {ok, State};
 write_trace_message(_File, _Message, _State) ->
     ignore.
+
+source_metadata(Module, Function, Arity, #state{manifest_index = ManifestIndex}) ->
+    maps:get({Module, Function, Arity}, ManifestIndex, #{
+        manifest_id => undefined,
+        function_key => undefined,
+        location_id => undefined,
+        clause_id => undefined,
+        source_location => #{
+            build_path => "<unknown>",
+            trace_copy_path => "generated/<unknown>",
+            line => 1,
+            column => undefined,
+            resolution => "unknown_generated_fallback"
+        }
+    }).
+
+source_metadata_json(Metadata) ->
+    SourceLocation = maps:get(source_location, Metadata),
+    [
+        "\"manifest_id\":", json_nullable_string(maps:get(manifest_id, Metadata)), ",",
+        "\"function_key\":", json_nullable_string(maps:get(function_key, Metadata)), ",",
+        "\"location_id\":", json_nullable_integer(maps:get(location_id, Metadata)), ",",
+        "\"clause_id\":", json_nullable_integer(maps:get(clause_id, Metadata)), ",",
+        "\"source_location\":{",
+        "\"build_path\":", json_string(maps:get(build_path, SourceLocation)), ",",
+        "\"trace_copy_path\":", json_string(maps:get(trace_copy_path, SourceLocation)), ",",
+        "\"line\":", integer_to_list(maps:get(line, SourceLocation)), ",",
+        "\"column\":", json_nullable_integer(maps:get(column, SourceLocation)), ",",
+        "\"resolution\":", json_string(maps:get(resolution, SourceLocation)),
+        "}"
+    ].
 
 write_thread_event(File, Event, ThreadId, RootPid, SourcePaths) ->
     Line = [
@@ -510,6 +624,8 @@ json_nullable_string(Value) ->
     json_string(Value).
 
 json_nullable_integer(undefined) ->
+    "null";
+json_nullable_integer(nil) ->
     "null";
 json_nullable_integer(Value) ->
     integer_to_list(Value).

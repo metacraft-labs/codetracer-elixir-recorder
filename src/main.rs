@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -512,6 +512,11 @@ impl RecordingSession {
                     function,
                     arity,
                     args,
+                    manifest_id,
+                    function_key,
+                    location_id,
+                    clause_id,
+                    source_location,
                 } => {
                     let function_id = interner.ensure_id(
                         &mut self.writer,
@@ -519,6 +524,7 @@ impl RecordingSession {
                         function,
                         *arity,
                         &self.runtime.source_root,
+                        source_location.as_ref(),
                     );
                     let args = args
                         .iter()
@@ -530,6 +536,24 @@ impl RecordingSession {
                             )
                         })
                         .collect::<Vec<_>>();
+                    if manifest_id.is_some() || location_id.is_some() {
+                        let payload = serde_json::json!({
+                            "schema": "codetracer.beam.source-location.v1",
+                            "module": module,
+                            "function": function,
+                            "arity": arity,
+                            "manifest_id": manifest_id,
+                            "function_key": function_key,
+                            "location_id": location_id,
+                            "clause_id": clause_id,
+                            "source_location": source_location,
+                        });
+                        self.writer.register_special_event(
+                            EventLogKind::TraceLogEvent,
+                            "beam_source_location",
+                            &payload.to_string(),
+                        );
+                    }
                     self.writer.register_call(function_id, args);
                 }
                 RuntimeTraceEvent::Return {
@@ -597,6 +621,8 @@ struct RuntimeSession {
     source_root: PathBuf,
     source_paths: Vec<PathBuf>,
     copied_sources: Vec<CopiedSource>,
+    manifests: Vec<ManifestArtifact>,
+    source_maps: Vec<SourceMapArtifact>,
     trace_functions: Vec<TraceFunctionSpec>,
 }
 
@@ -610,6 +636,29 @@ enum RuntimeMode {
 struct CopiedSource {
     source_path: String,
     bundle_path: String,
+    build_path: String,
+    project_relative_path: String,
+    trace_copy_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ManifestArtifact {
+    module: String,
+    manifest_id: String,
+    encoding: String,
+    schema: String,
+    build_path: String,
+    trace_copy_path: String,
+    #[serde(skip_serializing)]
+    runtime_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SourceMapArtifact {
+    source_language: String,
+    generated_build_path: String,
+    original_build_path: String,
+    trace_copy_path: String,
 }
 
 #[derive(Debug)]
@@ -645,6 +694,11 @@ struct RuntimeSidecarEvent {
     message_format: Option<String>,
     message_repr: Option<String>,
     message_truncated: Option<bool>,
+    manifest_id: Option<String>,
+    function_key: Option<String>,
+    location_id: Option<u32>,
+    clause_id: Option<u32>,
+    source_location: Option<ResolvedSourceLocation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -655,6 +709,24 @@ struct TraceFunctionSpec {
     kind: String,
     source_path: PathBuf,
     line: i64,
+    manifest_id: String,
+    function_key: String,
+    location_id: u32,
+    clause_id: u32,
+    resolved_source_path: PathBuf,
+    resolved_line: i64,
+    resolved_column: Option<u32>,
+    resolution_strategy: String,
+    trace_copy_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ResolvedSourceLocation {
+    build_path: String,
+    trace_copy_path: String,
+    line: i64,
+    column: Option<u32>,
+    resolution: String,
 }
 
 #[derive(Clone, Debug)]
@@ -673,6 +745,11 @@ enum RuntimeTraceEvent {
         function: String,
         arity: u32,
         args: Vec<serde_json::Value>,
+        manifest_id: Option<String>,
+        function_key: Option<String>,
+        location_id: Option<u32>,
+        clause_id: Option<u32>,
+        source_location: Option<ResolvedSourceLocation>,
     },
     Return {
         return_value: Option<serde_json::Value>,
@@ -705,6 +782,91 @@ struct BeamMessagePayload {
     message_truncated: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SparseSourceMap {
+    schema: String,
+    source_language: String,
+    generated_path: String,
+    original_path: String,
+    mappings: Vec<SparseSourceMapEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SparseSourceMapEntry {
+    generated_line: i64,
+    generated_column: Option<u32>,
+    original_line: i64,
+    original_column: Option<u32>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ModuleManifest {
+    schema: String,
+    encoding: String,
+    manifest_id: String,
+    module: ManifestModuleIdentity,
+    functions: Vec<ManifestFunction>,
+    locations: Vec<ManifestLocation>,
+    clauses: Vec<ManifestClause>,
+    variable_slot_templates: Vec<ManifestVariableSlotTemplate>,
+    traceable_mfas: Vec<ManifestMfa>,
+    source_maps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestModuleIdentity {
+    name: String,
+    source_language: String,
+    build_path: String,
+    project_relative_path: String,
+    trace_copy_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestFunction {
+    key: String,
+    name: String,
+    arity: u32,
+    visibility: String,
+    location_id: u32,
+    clause_ids: Vec<u32>,
+    traceable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestLocation {
+    id: u32,
+    build_path: String,
+    project_relative_path: String,
+    trace_copy_path: String,
+    line: i64,
+    column: Option<u32>,
+    resolution: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestClause {
+    id: u32,
+    function_key: String,
+    location_id: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestVariableSlotTemplate {
+    function_key: String,
+    slot: u32,
+    name: String,
+    source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestMfa {
+    module: String,
+    function: String,
+    arity: u32,
+}
+
 impl RuntimeSession {
     fn prepare(options: &RecordOptions) -> Result<Self, RecorderDiagnostic> {
         let source_root = env::current_dir().map_err(|error| {
@@ -723,8 +885,14 @@ impl RuntimeSession {
         } else {
             Vec::new()
         };
+        let discovered_source_maps = if mode == RuntimeMode::Beam {
+            discover_source_maps(&source_root)
+                .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
         let trace_functions = if mode == RuntimeMode::Beam {
-            discover_trace_functions(&source_paths)
+            discover_trace_functions(&source_root, &source_paths, &discovered_source_maps)
                 .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
         } else {
             Vec::new()
@@ -734,6 +902,17 @@ impl RuntimeSession {
                 .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
         } else {
             Vec::new()
+        };
+        let (manifests, source_maps) = if mode == RuntimeMode::Beam {
+            write_recorder_metadata(
+                &options.out_dir,
+                &source_root,
+                &trace_functions,
+                &discovered_source_maps,
+            )
+            .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            (Vec::new(), Vec::new())
         };
         let session_file = options.out_dir.join("runtime_session.jsonl");
         let runtime_ebin = if mode == RuntimeMode::Beam {
@@ -753,6 +932,8 @@ impl RuntimeSession {
             source_root,
             source_paths,
             copied_sources,
+            manifests,
+            source_maps,
             trace_functions,
         })
     }
@@ -894,6 +1075,11 @@ impl RuntimeSession {
                         function: require_sidecar_string(&event, "function", line_number + 1)?,
                         arity: require_sidecar_u32(&event, "arity", line_number + 1)?,
                         args: event.args.unwrap_or_default(),
+                        manifest_id: event.manifest_id,
+                        function_key: event.function_key,
+                        location_id: event.location_id,
+                        clause_id: event.clause_id,
+                        source_location: event.source_location,
                     });
                 }
                 "return_from" => {
@@ -1056,6 +1242,7 @@ impl FunctionInterner {
         function: &str,
         arity: u32,
         source_root: &Path,
+        runtime_location: Option<&ResolvedSourceLocation>,
     ) -> FunctionId {
         let spec = self
             .specs
@@ -1068,21 +1255,40 @@ impl FunctionInterner {
                 kind: "beam".to_string(),
                 source_path: source_root.join("<unknown>"),
                 line: 1,
+                manifest_id: "unknown".to_string(),
+                function_key: format!("{module}.{function}/{arity}"),
+                location_id: 0,
+                clause_id: 0,
+                resolved_source_path: runtime_location
+                    .map(|location| PathBuf::from(&location.build_path))
+                    .unwrap_or_else(|| source_root.join("<unknown>")),
+                resolved_line: runtime_location.map(|location| location.line).unwrap_or(1),
+                resolved_column: runtime_location.and_then(|location| location.column),
+                resolution_strategy: runtime_location
+                    .map(|location| location.resolution.clone())
+                    .unwrap_or_else(|| "unknown_generated_fallback".to_string()),
+                trace_copy_path: runtime_location
+                    .map(|location| location.trace_copy_path.clone())
+                    .unwrap_or_else(|| "generated/<unknown>".to_string()),
             });
         let key = FunctionKey {
             module: spec.module.clone(),
             function: spec.function.clone(),
             arity: spec.arity,
             kind: spec.kind.clone(),
-            defining_path: spec.source_path.clone(),
-            defining_line: spec.line,
+            defining_path: spec.resolved_source_path.clone(),
+            defining_line: spec.resolved_line,
         };
         if let Some(id) = self.ids.get(&key) {
             return *id;
         }
 
         let display_name = function_display_name(&spec);
-        let id = writer.ensure_function_id(&display_name, &spec.source_path, Line(spec.line));
+        let id = writer.ensure_function_id(
+            &display_name,
+            &spec.resolved_source_path,
+            Line(spec.resolved_line),
+        );
         self.ids.insert(key, id);
         id
     }
@@ -1237,15 +1443,287 @@ fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> 
     Ok(())
 }
 
-fn discover_trace_functions(source_paths: &[PathBuf]) -> io::Result<Vec<TraceFunctionSpec>> {
+fn discover_source_maps(source_root: &Path) -> io::Result<Vec<SparseSourceMap>> {
+    let mut paths = Vec::new();
+    for dirname in ["source_maps", "codetracer_source_maps"] {
+        let dir = source_root.join(dirname);
+        if dir.is_dir() {
+            collect_json_paths(&dir, &mut paths)?;
+        }
+    }
+
+    let mut source_maps = Vec::new();
+    for path in paths {
+        let text = fs::read_to_string(&path)?;
+        let mut map: SparseSourceMap = serde_json::from_str(&text).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid source map {}: {error}", path.display()),
+            )
+        })?;
+        if map.schema != "codetracer.beam.sourcemap.v1" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported source map schema {} in {}",
+                    map.schema,
+                    path.display()
+                ),
+            ));
+        }
+        map.generated_path =
+            normalize_build_path(&resolve_mapped_path(source_root, &map.generated_path))
+                .display()
+                .to_string();
+        map.original_path =
+            normalize_build_path(&resolve_mapped_path(source_root, &map.original_path))
+                .display()
+                .to_string();
+        source_maps.push(map);
+    }
+    source_maps.sort_by(|left, right| {
+        (&left.generated_path, &left.original_path)
+            .cmp(&(&right.generated_path, &right.original_path))
+    });
+    Ok(source_maps)
+}
+
+fn collect_json_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_json_paths(&path, paths)?;
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn write_recorder_metadata(
+    out_dir: &Path,
+    source_root: &Path,
+    trace_functions: &[TraceFunctionSpec],
+    source_maps: &[SparseSourceMap],
+) -> Result<(Vec<ManifestArtifact>, Vec<SourceMapArtifact>), Box<dyn Error>> {
+    let metadata_root = out_dir.join("recorder_metadata");
+    let manifests_root = metadata_root.join("manifests");
+    let source_maps_root = metadata_root.join("source_maps");
+    fs::create_dir_all(&manifests_root)?;
+    fs::create_dir_all(&source_maps_root)?;
+
+    let source_map_artifacts =
+        write_source_map_artifacts(source_root, &source_maps_root, source_maps)?;
+    let manifest_artifacts = write_module_manifests(
+        source_root,
+        &manifests_root,
+        trace_functions,
+        &source_map_artifacts,
+    )?;
+
+    Ok((manifest_artifacts, source_map_artifacts))
+}
+
+fn write_source_map_artifacts(
+    source_root: &Path,
+    source_maps_root: &Path,
+    source_maps: &[SparseSourceMap],
+) -> Result<Vec<SourceMapArtifact>, Box<dyn Error>> {
+    let mut artifacts = Vec::new();
+    for (index, source_map) in source_maps.iter().enumerate() {
+        let filename = format!(
+            "{:03}-{}.json",
+            index + 1,
+            safe_filename(&project_relative_path(
+                source_root,
+                Path::new(&source_map.generated_path)
+            ))
+        );
+        let trace_copy_path = format!("recorder_metadata/source_maps/{filename}");
+        let destination = source_maps_root.join(filename);
+        let json = serde_json::to_vec_pretty(source_map)?;
+        fs::write(&destination, json)?;
+        artifacts.push(SourceMapArtifact {
+            source_language: source_map.source_language.clone(),
+            generated_build_path: source_map.generated_path.clone(),
+            original_build_path: source_map.original_path.clone(),
+            trace_copy_path,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn write_module_manifests(
+    source_root: &Path,
+    manifests_root: &Path,
+    trace_functions: &[TraceFunctionSpec],
+    source_maps: &[SourceMapArtifact],
+) -> Result<Vec<ManifestArtifact>, Box<dyn Error>> {
+    let mut by_module: BTreeMap<String, Vec<TraceFunctionSpec>> = BTreeMap::new();
+    for function in trace_functions {
+        by_module
+            .entry(function.module.clone())
+            .or_default()
+            .push(function.clone());
+    }
+
+    let mut artifacts = Vec::new();
+    for (module, mut functions) in by_module {
+        functions.sort_by(|left, right| {
+            (&left.function, left.arity, left.line).cmp(&(&right.function, right.arity, right.line))
+        });
+        let first = functions
+            .first()
+            .ok_or_else(|| format!("module {module} has no functions"))?;
+        let build_path = first.source_path.display().to_string();
+        let project_relative = project_relative_path(source_root, &first.source_path);
+        let trace_copy = trace_copy_path(source_root, &first.source_path);
+        let manifest_id = manifest_id_for_module(&module);
+        let source_language = first.kind.clone();
+        let manifest = ModuleManifest {
+            schema: "codetracer.beam.module-manifest.v1".to_string(),
+            encoding: "json".to_string(),
+            manifest_id: manifest_id.clone(),
+            module: ManifestModuleIdentity {
+                name: module.clone(),
+                source_language,
+                build_path: build_path.clone(),
+                project_relative_path: project_relative.clone(),
+                trace_copy_path: trace_copy.clone(),
+            },
+            functions: functions
+                .iter()
+                .map(|function| ManifestFunction {
+                    key: function.function_key.clone(),
+                    name: function.function.clone(),
+                    arity: function.arity,
+                    visibility: "unknown".to_string(),
+                    location_id: function.location_id,
+                    clause_ids: vec![function.clause_id],
+                    traceable: true,
+                })
+                .collect(),
+            locations: functions
+                .iter()
+                .map(|function| ManifestLocation {
+                    id: function.location_id,
+                    build_path: function.resolved_source_path.display().to_string(),
+                    project_relative_path: project_relative_path(
+                        source_root,
+                        &function.resolved_source_path,
+                    ),
+                    trace_copy_path: function.trace_copy_path.clone(),
+                    line: function.resolved_line,
+                    column: function.resolved_column,
+                    resolution: function.resolution_strategy.clone(),
+                })
+                .collect(),
+            clauses: functions
+                .iter()
+                .map(|function| ManifestClause {
+                    id: function.clause_id,
+                    function_key: function.function_key.clone(),
+                    location_id: function.location_id,
+                })
+                .collect(),
+            variable_slot_templates: functions
+                .iter()
+                .flat_map(|function| {
+                    (0..function.arity).map(|slot| ManifestVariableSlotTemplate {
+                        function_key: function.function_key.clone(),
+                        slot,
+                        name: format!("_arg{slot}"),
+                        source: "runtime_call_arg".to_string(),
+                    })
+                })
+                .collect(),
+            traceable_mfas: functions
+                .iter()
+                .map(|function| ManifestMfa {
+                    module: function.module.clone(),
+                    function: function.function.clone(),
+                    arity: function.arity,
+                })
+                .collect(),
+            source_maps: source_maps
+                .iter()
+                .filter(|source_map| {
+                    functions.iter().any(|function| {
+                        source_map.generated_build_path
+                            == function.source_path.display().to_string()
+                    })
+                })
+                .map(|source_map| source_map.trace_copy_path.clone())
+                .collect(),
+        };
+
+        let reparsed = decode_manifest_json(&encode_manifest_json(&manifest)?)?;
+        if reparsed.schema != manifest.schema || reparsed.manifest_id != manifest.manifest_id {
+            return Err(format!("manifest JSON roundtrip failed for module {module}").into());
+        }
+
+        let filename = format!("{}.manifest.json", safe_filename(&module));
+        let trace_copy_path = format!("recorder_metadata/manifests/{filename}");
+        let destination = manifests_root.join(filename);
+        fs::write(&destination, encode_manifest_json(&manifest)?)?;
+        artifacts.push(ManifestArtifact {
+            module,
+            manifest_id,
+            encoding: "json".to_string(),
+            schema: "codetracer.beam.module-manifest.v1".to_string(),
+            build_path,
+            trace_copy_path,
+            runtime_path: destination.display().to_string(),
+        });
+    }
+    Ok(artifacts)
+}
+
+fn encode_manifest_json(manifest: &ModuleManifest) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec_pretty(manifest)
+}
+
+fn decode_manifest_json(bytes: &[u8]) -> Result<ModuleManifest, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
+
+fn safe_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn discover_trace_functions(
+    source_root: &Path,
+    source_paths: &[PathBuf],
+    source_maps: &[SparseSourceMap],
+) -> io::Result<Vec<TraceFunctionSpec>> {
     let mut functions = Vec::new();
     for source_path in source_paths {
         match source_path
             .extension()
             .and_then(|extension| extension.to_str())
         {
-            Some("ex" | "exs") => collect_elixir_trace_functions(source_path, &mut functions)?,
-            Some("erl") => collect_erlang_trace_functions(source_path, &mut functions)?,
+            Some("ex" | "exs") => collect_elixir_trace_functions(
+                source_root,
+                source_maps,
+                source_path,
+                &mut functions,
+            )?,
+            Some("erl") => collect_erlang_trace_functions(
+                source_root,
+                source_maps,
+                source_path,
+                &mut functions,
+            )?,
             _ => {}
         }
     }
@@ -1276,6 +1754,8 @@ fn discover_trace_functions(source_paths: &[PathBuf]) -> io::Result<Vec<TraceFun
 }
 
 fn collect_elixir_trace_functions(
+    source_root: &Path,
+    source_maps: &[SparseSourceMap],
     source_path: &Path,
     functions: &mut Vec<TraceFunctionSpec>,
 ) -> io::Result<()> {
@@ -1299,14 +1779,17 @@ fn collect_elixir_trace_functions(
                 if function.is_empty() || function == "module" {
                     continue;
                 }
-                functions.push(TraceFunctionSpec {
-                    module: module.clone(),
-                    function,
-                    arity: arity_from_elixir_def(rest),
-                    kind: "elixir".to_string(),
-                    source_path: source_path.to_path_buf(),
+                let arity = arity_from_elixir_def(rest);
+                functions.push(trace_function_spec(TraceFunctionInput {
+                    source_root,
+                    source_maps,
+                    module,
+                    function: &function,
+                    arity,
+                    kind: "elixir",
+                    source_path,
                     line: (index + 1) as i64,
-                });
+                }));
             }
         }
     }
@@ -1315,6 +1798,8 @@ fn collect_elixir_trace_functions(
 }
 
 fn collect_erlang_trace_functions(
+    source_root: &Path,
+    source_maps: &[SparseSourceMap],
     source_path: &Path,
     functions: &mut Vec<TraceFunctionSpec>,
 ) -> io::Result<()> {
@@ -1345,17 +1830,67 @@ fn collect_erlang_trace_functions(
         let Some((args, _)) = rest.split_once(')') else {
             continue;
         };
-        functions.push(TraceFunctionSpec {
-            module: module.clone(),
-            function,
-            arity: arity_from_args(args),
-            kind: "erlang".to_string(),
-            source_path: source_path.to_path_buf(),
+        let arity = arity_from_args(args);
+        functions.push(trace_function_spec(TraceFunctionInput {
+            source_root,
+            source_maps,
+            module,
+            function: &function,
+            arity,
+            kind: "erlang",
+            source_path,
             line: (index + 1) as i64,
-        });
+        }));
     }
 
     Ok(())
+}
+
+struct TraceFunctionInput<'a> {
+    source_root: &'a Path,
+    source_maps: &'a [SparseSourceMap],
+    module: &'a str,
+    function: &'a str,
+    arity: u32,
+    kind: &'a str,
+    source_path: &'a Path,
+    line: i64,
+}
+
+fn trace_function_spec(input: TraceFunctionInput<'_>) -> TraceFunctionSpec {
+    let TraceFunctionInput {
+        source_root,
+        source_maps,
+        module,
+        function,
+        arity,
+        kind,
+        source_path,
+        line,
+    } = input;
+    let source_path = normalize_build_path(source_path);
+    let resolved = resolve_source_location(source_root, source_maps, &source_path, line, None);
+    let function_key = format!("{module}.{function}/{arity}");
+    let location_id = stable_id(&format!("{function_key}:location:{line}"));
+    let clause_id = stable_id(&format!("{function_key}:clause:{line}"));
+
+    TraceFunctionSpec {
+        module: module.to_string(),
+        function: function.to_string(),
+        arity,
+        kind: kind.to_string(),
+        source_path,
+        line,
+        manifest_id: manifest_id_for_module(module),
+        function_key,
+        location_id,
+        clause_id,
+        resolved_source_path: PathBuf::from(&resolved.build_path),
+        resolved_line: resolved.line,
+        resolved_column: resolved.column,
+        resolution_strategy: resolved.resolution,
+        trace_copy_path: resolved.trace_copy_path,
+    }
 }
 
 fn take_identifier(text: &str) -> String {
@@ -1399,23 +1934,167 @@ fn is_source_file(path: &Path) -> bool {
     )
 }
 
+fn normalize_build_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+fn project_relative_path(source_root: &Path, path: &Path) -> String {
+    path.strip_prefix(source_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn trace_copy_path(source_root: &Path, path: &Path) -> String {
+    format!(
+        "files/{}",
+        project_relative_path(source_root, path).replace('\\', "/")
+    )
+}
+
+fn manifest_id_for_module(module: &str) -> String {
+    format!("beam-manifest-v1:{module}")
+}
+
+fn stable_id(text: &str) -> u32 {
+    let mut hash = 2_166_136_261_u32;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+fn resolve_source_location(
+    source_root: &Path,
+    source_maps: &[SparseSourceMap],
+    generated_path: &Path,
+    line: i64,
+    column: Option<u32>,
+) -> ResolvedSourceLocation {
+    let generated_build_path = normalize_build_path(generated_path);
+    if let Some((map, entry)) = find_source_map_entry(
+        source_root,
+        source_maps,
+        &generated_build_path,
+        line,
+        column,
+    ) {
+        let original_path =
+            normalize_build_path(&resolve_mapped_path(source_root, &map.original_path));
+        return ResolvedSourceLocation {
+            build_path: original_path.display().to_string(),
+            trace_copy_path: trace_copy_path(source_root, &original_path),
+            line: entry.original_line,
+            column: entry.original_column,
+            resolution: "source_map".to_string(),
+        };
+    }
+
+    if generated_build_path.is_file() && line > 0 {
+        return ResolvedSourceLocation {
+            build_path: generated_build_path.display().to_string(),
+            trace_copy_path: trace_copy_path(source_root, &generated_build_path),
+            line,
+            column,
+            resolution: "erl_anno".to_string(),
+        };
+    }
+
+    if generated_build_path.is_file() {
+        return ResolvedSourceLocation {
+            build_path: generated_build_path.display().to_string(),
+            trace_copy_path: trace_copy_path(source_root, &generated_build_path),
+            line: 1,
+            column: None,
+            resolution: "module_file_fallback".to_string(),
+        };
+    }
+
+    ResolvedSourceLocation {
+        build_path: generated_build_path.display().to_string(),
+        trace_copy_path: "generated/<unknown>".to_string(),
+        line: 1,
+        column: None,
+        resolution: "unknown_generated_fallback".to_string(),
+    }
+}
+
+fn find_source_map_entry<'a>(
+    source_root: &Path,
+    source_maps: &'a [SparseSourceMap],
+    generated_path: &Path,
+    line: i64,
+    column: Option<u32>,
+) -> Option<(&'a SparseSourceMap, &'a SparseSourceMapEntry)> {
+    source_maps.iter().find_map(|map| {
+        let map_generated =
+            normalize_build_path(&resolve_mapped_path(source_root, &map.generated_path));
+        if map_generated != generated_path {
+            return None;
+        }
+        map.mappings
+            .iter()
+            .find(|entry| {
+                entry.generated_line == line
+                    && (entry.generated_column.is_none() || entry.generated_column == column)
+            })
+            .map(|entry| (map, entry))
+    })
+}
+
+fn resolve_mapped_path(source_root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        source_root.join(path)
+    }
+}
+
 fn copy_sources(
     out_dir: &Path,
     source_root: &Path,
     source_paths: &[PathBuf],
 ) -> io::Result<Vec<CopiedSource>> {
-    let bundle_root = out_dir.join("source_map");
+    let compatibility_bundle_root = out_dir.join("source_map");
+    let files_bundle_root = out_dir.join("files");
     let mut copied = Vec::new();
     for source_path in source_paths {
-        let relative = source_path.strip_prefix(source_root).unwrap_or(source_path);
-        let destination = bundle_root.join(relative);
+        let source_path = normalize_build_path(source_path);
+        let relative = source_path
+            .strip_prefix(source_root)
+            .unwrap_or(&source_path);
+        let destination = compatibility_bundle_root.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(source_path, &destination)?;
+        fs::copy(&source_path, &destination)?;
+        let files_destination = files_bundle_root.join(relative);
+        if let Some(parent) = files_destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source_path, &files_destination)?;
+        let project_relative_path = relative.display().to_string();
+        let trace_copy_path = format!("files/{}", project_relative_path.replace('\\', "/"));
         copied.push(CopiedSource {
             source_path: source_path.display().to_string(),
             bundle_path: destination.display().to_string(),
+            build_path: source_path.display().to_string(),
+            project_relative_path,
+            trace_copy_path,
         });
     }
     Ok(copied)
@@ -1445,18 +2124,32 @@ fn wrap_erlang_entrypoint(module: &str, function: &str, runtime: &RuntimeSession
 
 fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
-        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:trace_functions, {trace_functions}}}]",
+        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}]",
         session_file = elixir_charlist(&runtime.session_file.display().to_string()),
         source_paths = elixir_charlist_list(&runtime.source_paths),
+        manifest_paths = elixir_string_list(
+            &runtime
+                .manifests
+                .iter()
+                .map(|manifest| manifest.runtime_path.clone())
+                .collect::<Vec<_>>()
+        ),
         trace_functions = elixir_trace_function_list(&runtime.trace_functions)
     )
 }
 
 fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
-        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{trace_functions,{trace_functions}}}]",
+        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{manifest_paths,{manifest_paths}}},{{trace_functions,{trace_functions}}}]",
         session_file = erlang_string(&runtime.session_file.display().to_string()),
         source_paths = erlang_string_list(&runtime.source_paths),
+        manifest_paths = erlang_string_vec(
+            &runtime
+                .manifests
+                .iter()
+                .map(|manifest| manifest.runtime_path.clone())
+                .collect::<Vec<_>>()
+        ),
         trace_functions = erlang_trace_function_list(&runtime.trace_functions)
     )
 }
@@ -1477,18 +2170,44 @@ fn erlang_string_list(paths: &[PathBuf]) -> String {
     format!("[{}]", values.join(","))
 }
 
+fn elixir_string_list(values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| elixir_charlist(value))
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
+}
+
+fn erlang_string_vec(values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| erlang_string(value))
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(","))
+}
+
 fn elixir_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
     let values = functions
         .iter()
         .map(|function| {
             format!(
-                "{{{module}, {name}, {arity}, {kind}, {source_path}, {line}}}",
+                "{{{module}, {name}, {arity}, {kind}, {source_path}, {line}, {manifest_id}, {function_key}, {location_id}, {clause_id}, {resolved_source_path}, {resolved_line}, {resolved_column}, {resolution_strategy}, {trace_copy_path}}}",
                 module = elixir_atom(&function.module),
                 name = elixir_atom(&function.function),
                 arity = function.arity,
                 kind = elixir_charlist(&function.kind),
                 source_path = elixir_charlist(&function.source_path.display().to_string()),
-                line = function.line
+                line = function.line,
+                manifest_id = elixir_charlist(&function.manifest_id),
+                function_key = elixir_charlist(&function.function_key),
+                location_id = function.location_id,
+                clause_id = function.clause_id,
+                resolved_source_path =
+                    elixir_charlist(&function.resolved_source_path.display().to_string()),
+                resolved_line = function.resolved_line,
+                resolved_column = optional_u32_elixir(function.resolved_column),
+                resolution_strategy = elixir_charlist(&function.resolution_strategy),
+                trace_copy_path = elixir_charlist(&function.trace_copy_path)
             )
         })
         .collect::<Vec<_>>();
@@ -1500,17 +2219,38 @@ fn erlang_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
         .iter()
         .map(|function| {
             format!(
-                "{{{module},{name},{arity},{kind},{source_path},{line}}}",
+                "{{{module},{name},{arity},{kind},{source_path},{line},{manifest_id},{function_key},{location_id},{clause_id},{resolved_source_path},{resolved_line},{resolved_column},{resolution_strategy},{trace_copy_path}}}",
                 module = erlang_atom(&function.module),
                 name = erlang_atom(&function.function),
                 arity = function.arity,
                 kind = erlang_string(&function.kind),
                 source_path = erlang_string(&function.source_path.display().to_string()),
-                line = function.line
+                line = function.line,
+                manifest_id = erlang_string(&function.manifest_id),
+                function_key = erlang_string(&function.function_key),
+                location_id = function.location_id,
+                clause_id = function.clause_id,
+                resolved_source_path = erlang_string(&function.resolved_source_path.display().to_string()),
+                resolved_line = function.resolved_line,
+                resolved_column = optional_u32_erlang(function.resolved_column),
+                resolution_strategy = erlang_string(&function.resolution_strategy),
+                trace_copy_path = erlang_string(&function.trace_copy_path)
             )
         })
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))
+}
+
+fn optional_u32_elixir(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "nil".to_string())
+}
+
+fn optional_u32_erlang(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "undefined".to_string())
 }
 
 fn elixir_charlist(value: &str) -> String {
@@ -1623,6 +2363,9 @@ struct CompatibilityTraceMeta<'a> {
     artifacts: CompatibilityArtifacts,
     runtime_session: CompatibilityRuntimeSession,
     sources: &'a [CopiedSource],
+    manifests: &'a [ManifestArtifact],
+    source_maps: &'a [SourceMapArtifact],
+    metadata_contract: CompatibilityMetadataContract,
 }
 
 #[derive(Serialize)]
@@ -1649,6 +2392,14 @@ struct CompatibilityRuntimeSession {
     sidecar: String,
     source_root: String,
     injection_decision: String,
+}
+
+#[derive(Serialize)]
+struct CompatibilityMetadataContract {
+    manifest_schema: &'static str,
+    manifest_encoding: &'static str,
+    source_map_schema: &'static str,
+    source_location_resolver_order: [&'static str; 4],
 }
 
 fn write_trace_meta_json(
@@ -1686,6 +2437,19 @@ fn write_trace_meta_json(
             injection_decision: session.prepared_target.injection_decision.clone(),
         },
         sources: &session.runtime.copied_sources,
+        manifests: &session.runtime.manifests,
+        source_maps: &session.runtime.source_maps,
+        metadata_contract: CompatibilityMetadataContract {
+            manifest_schema: "codetracer.beam.module-manifest.v1",
+            manifest_encoding: "json",
+            source_map_schema: "codetracer.beam.sourcemap.v1",
+            source_location_resolver_order: [
+                "source_map",
+                "erl_anno",
+                "module_file_fallback",
+                "unknown_generated_fallback",
+            ],
+        },
     };
     let json = serde_json::to_vec_pretty(&meta)?;
     fs::write(session.out_dir.join("trace_meta.json"), json)?;
