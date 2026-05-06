@@ -28,6 +28,13 @@
 
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = with pkgs; [
+            capnproto
+            pkg-config
+          ];
+          buildInputs = with pkgs; [
+            zstd
+          ];
 
           meta = {
             description = "CodeTracer Elixir and Erlang materialized trace recorder";
@@ -88,16 +95,19 @@
               with pkgs;
               [
                 cargo
+                capnproto
                 clippy
                 elixir
                 erlang
                 just
                 jq
                 nixfmt
+                pkg-config
                 rustc
                 rustfmt
                 shellcheck
                 shfmt
+                zstd
               ]
               ++ preCommit.enabledPackages;
 
