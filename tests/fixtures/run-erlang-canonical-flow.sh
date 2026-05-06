@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_root/test-programs/erlang/canonical_flow"
-build_dir="$(mktemp -d)"
+build_dir="$(mktemp -d "${TMPDIR:-/tmp}/codetracer-erlang-fixture-build.XXXXXX")"
 ebin_dir="$build_dir/ebin"
 
 cleanup() {

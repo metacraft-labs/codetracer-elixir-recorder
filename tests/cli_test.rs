@@ -94,6 +94,171 @@ fn compile_erlang_fixture(ebin_dir: &Path) {
 }
 
 #[test]
+fn e2e_runtime_session_records_real_elixir_process() {
+    let tmp = temp_dir("runtime-elixir");
+    let out_dir = tmp.join("trace");
+    let elixir_fixture = repo_root().join("test-programs/elixir/canonical_flow");
+    let mix_build_root = tmp.join("mix-build");
+    compile_elixir_fixture(&elixir_fixture, &mix_build_root);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "mix",
+            "run",
+            "--no-compile",
+            "-e",
+            "CanonicalFlow.main()",
+        ])
+        .current_dir(&elixir_fixture)
+        .env("MIX_ENV", "test")
+        .env("MIX_BUILD_ROOT", &mix_build_root)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Elixir fixture under runtime session");
+
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "94\n");
+    assert_runtime_session_trace(
+        &out_dir,
+        "mix.ct",
+        "Mix M4 injection",
+        "lib/canonical_flow.ex",
+    );
+}
+
+#[test]
+fn e2e_runtime_session_records_real_erlang_process() {
+    let tmp = temp_dir("runtime-erlang");
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/canonical_flow");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_fixture(&ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "canonical_flow",
+            "main",
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Erlang fixture under runtime session");
+
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "94\n");
+    assert_runtime_session_trace(
+        &out_dir,
+        "erl.ct",
+        "plain erl M4 injection",
+        "src/canonical_flow.erl",
+    );
+}
+
+fn assert_runtime_session_trace(
+    out_dir: &Path,
+    ct_file_name: &str,
+    expected_injection_text: &str,
+    expected_source: &str,
+) {
+    let ct_path = out_dir.join(ct_file_name);
+    assert!(
+        ct_path.is_file(),
+        "expected CTFS trace at {}",
+        ct_path.display()
+    );
+
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().expect("trace path utf-8"))
+        .expect("open runtime CTFS trace through real reader bridge");
+    let step_jsons = (0..reader.step_count())
+        .map(|index| reader.step_json(index).expect("read step json"))
+        .collect::<Vec<_>>();
+    assert!(
+        step_jsons
+            .iter()
+            .any(|json| json.contains("\"kind\":\"thread_start\"")
+                && json.contains("\"thread_id\":1")),
+        "missing root ThreadStart in {step_jsons:#?}"
+    );
+    assert!(
+        step_jsons
+            .iter()
+            .any(|json| json.contains("\"kind\":\"thread_switch\"")
+                && json.contains("\"thread_id\":1")),
+        "missing initial root ThreadSwitch in {step_jsons:#?}"
+    );
+    assert!(
+        step_jsons
+            .iter()
+            .any(|json| json.contains("\"kind\":\"thread_exit\"")
+                && json.contains("\"thread_id\":1")),
+        "missing root ThreadExit in {step_jsons:#?}"
+    );
+
+    let copied_source = out_dir.join("source_map").join(expected_source);
+    assert!(
+        copied_source.is_file(),
+        "expected copied source at {}",
+        copied_source.display()
+    );
+
+    let trace_meta_path = out_dir.join("trace_meta.json");
+    let trace_meta_text = fs::read_to_string(&trace_meta_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", trace_meta_path.display()));
+    let trace_meta: Value = serde_json::from_str(&trace_meta_text).expect("trace_meta.json");
+    assert_eq!(trace_meta["runtime_session"]["mode"], "beam");
+    assert_eq!(trace_meta["runtime_session"]["delivered"], true);
+    assert_eq!(trace_meta["runtime_session"]["root_thread_id"], 1);
+    assert!(
+        trace_meta["runtime_session"]["root_pid"].as_str().is_some(),
+        "root BEAM pid should be recorded in metadata: {trace_meta}"
+    );
+    assert!(
+        trace_meta["runtime_session"]["injection_decision"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(expected_injection_text),
+        "unexpected injection decision: {}",
+        trace_meta["runtime_session"]["injection_decision"]
+    );
+    assert!(
+        trace_meta["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["bundle_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(expected_source))
+            })
+        }),
+        "trace metadata should list copied source {expected_source}: {trace_meta}"
+    );
+
+    let sidecar_path = out_dir.join("runtime_session.jsonl");
+    let sidecar = fs::read_to_string(&sidecar_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", sidecar_path.display()));
+    assert!(
+        sidecar.contains(r#""event":"trace_delivered""#)
+            && sidecar.contains(r#""delivery_target":"all""#)
+            && sidecar.contains("\"delivery_ref\":\"#Ref<"),
+        "runtime sidecar should prove erlang:trace_delivered(all) completed: {sidecar}"
+    );
+}
+
+#[test]
 fn e2e_cli_records_disabled_target_execution() {
     let tmp = temp_dir("disabled");
     let elixir_fixture = repo_root().join("test-programs/elixir/canonical_flow");

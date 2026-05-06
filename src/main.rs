@@ -12,12 +12,14 @@ use codetracer_trace_writer::trace_writer::TraceWriter as RustTraceWriter;
 use codetracer_trace_writer_nim::{
     NimTraceReaderHandle, NimTraceWriter, TraceEventsFileFormat as NimFormat,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const BINARY_NAME: &str = "codetracer-elixir-recorder";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FIXTURE_PROGRAM: &str = "codetracer_elixir_m2_bridge";
 const FIXTURE_SOURCE: &str = "test-programs/elixir/canonical_flow/lib/canonical_flow.ex";
+const RUNTIME_APP_NAME: &str = "codetracer_erlang_runtime";
+const RUNTIME_THREAD_ID: u64 = 1;
 
 fn main() {
     match run() {
@@ -100,7 +102,7 @@ fn record_command(subcommand: &'static str, args: Vec<String>) -> Result<i32, Re
 
             ensure_output_directory(&options.out_dir)?;
             let mut session = RecordingSession::begin(subcommand, &options)?;
-            let status = run_target(&options.target)?;
+            let status = run_prepared_target(&session.prepared_target)?;
             let code = exit_code(status);
             session.finish(code)?;
             Ok(code)
@@ -115,10 +117,18 @@ fn recording_disabled() -> bool {
 }
 
 fn run_target(target: &[String]) -> Result<ExitStatus, RecorderDiagnostic> {
-    Command::new(&target[0])
-        .args(&target[1..])
+    let prepared = PreparedTarget::plain(target.to_vec());
+    run_prepared_target(&prepared)
+}
+
+fn run_prepared_target(target: &PreparedTarget) -> Result<ExitStatus, RecorderDiagnostic> {
+    let mut command = Command::new(&target.command);
+    command
+        .args(&target.args)
+        .envs(target.env.iter().map(|(key, value)| (key, value)));
+    command
         .status()
-        .map_err(|error| RecorderDiagnostic::target_spawn_failed(&target[0], error))
+        .map_err(|error| RecorderDiagnostic::target_spawn_failed(&target.command, error))
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
@@ -137,6 +147,27 @@ struct RecordOptions {
     out_dir: PathBuf,
     format: OutputFormat,
     target: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedTarget {
+    command: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    injection_decision: String,
+}
+
+impl PreparedTarget {
+    fn plain(target: Vec<String>) -> Self {
+        let mut iter = target.into_iter();
+        let command = iter.next().unwrap_or_default();
+        Self {
+            command,
+            args: iter.collect(),
+            env: Vec::new(),
+            injection_decision: "runtime not injected for non-BEAM target".to_string(),
+        }
+    }
 }
 
 fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, RecorderDiagnostic> {
@@ -300,6 +331,14 @@ impl RecorderDiagnostic {
         )
     }
 
+    fn runtime_bootstrap_failed(detail: impl Into<String>) -> Self {
+        Self::new(
+            "runtime_bootstrap_failed",
+            "failed to prepare BEAM runtime session".to_string(),
+            Some(detail.into()),
+        )
+    }
+
     fn writer_finalization_failed(detail: impl Into<String>) -> Self {
         Self::new(
             "writer_finalization_failed",
@@ -338,6 +377,8 @@ struct RecordingSession {
     program_name: String,
     subcommand: &'static str,
     options: RecordOptions,
+    runtime: RuntimeSession,
+    prepared_target: PreparedTarget,
 }
 
 impl RecordingSession {
@@ -346,6 +387,8 @@ impl RecordingSession {
         options: &RecordOptions,
     ) -> Result<Self, RecorderDiagnostic> {
         let program_name = target_program_name(&options.target[0]);
+        let runtime = RuntimeSession::prepare(options)?;
+        let prepared_target = runtime.prepare_target(&options.target)?;
         let writer = panic::catch_unwind({
             let program_name = program_name.clone();
             let format = options.format.as_nim_format();
@@ -361,6 +404,8 @@ impl RecordingSession {
             program_name,
             subcommand,
             options: options.clone(),
+            runtime,
+            prepared_target,
         };
         session.initialize_writer()?;
         Ok(session)
@@ -375,7 +420,12 @@ impl RecordingSession {
         let metadata_path = self.out_dir.join("trace_metadata.json");
         let events_path = self.out_dir.join("trace.json");
         let paths_path = self.out_dir.join("trace_paths.json");
-        let source_path = recording_anchor_path(&self.options.target[0]);
+        let source_path = self
+            .runtime
+            .source_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| recording_anchor_path(&self.options.target[0]));
 
         let write_probe_path = self.out_dir.join(".codetracer-writer-init-check");
         fs::OpenOptions::new()
@@ -403,17 +453,25 @@ impl RecordingSession {
             .finish_writing_trace_paths()
             .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?;
         self.writer.start(&source_path, Line(1));
-        self.writer.register_step(&source_path, Line(1));
-        self.writer.register_special_event(
-            EventLogKind::Write,
-            "m3",
-            "cli skeleton initialized real target execution",
-        );
 
         Ok(())
     }
 
     fn finish(&mut self, target_exit_code: i32) -> Result<(), RecorderDiagnostic> {
+        let runtime_result = self.runtime.read_delivery()?;
+        if runtime_result.delivered {
+            self.writer.register_thread_start(runtime_result.thread_id);
+            self.writer.register_thread_switch(runtime_result.thread_id);
+            self.writer.register_thread_exit(runtime_result.thread_id);
+        }
+        self.writer.register_special_event(
+            EventLogKind::Write,
+            "m4",
+            &format!(
+                "runtime_session delivered={} injection={}",
+                runtime_result.delivered, self.prepared_target.injection_decision
+            ),
+        );
         self.writer
             .finish_writing_trace_events()
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))?;
@@ -424,14 +482,470 @@ impl RecordingSession {
             .close()
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))?;
 
-        write_trace_meta_json(
-            &self.out_dir,
-            &self.program_name,
-            self.subcommand,
-            &self.options,
-            target_exit_code,
-        )
-        .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
+        write_trace_meta_json(self, &runtime_result, target_exit_code)
+            .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeSession {
+    mode: RuntimeMode,
+    session_file: PathBuf,
+    runtime_ebin: Option<PathBuf>,
+    source_root: PathBuf,
+    source_paths: Vec<PathBuf>,
+    copied_sources: Vec<CopiedSource>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeMode {
+    Beam,
+    NonBeam,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CopiedSource {
+    source_path: String,
+    bundle_path: String,
+}
+
+#[derive(Debug)]
+struct RuntimeDelivery {
+    delivered: bool,
+    thread_id: u64,
+    root_pid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeSidecarEvent {
+    event: String,
+    thread_id: Option<u64>,
+    root_pid: Option<String>,
+}
+
+impl RuntimeSession {
+    fn prepare(options: &RecordOptions) -> Result<Self, RecorderDiagnostic> {
+        let source_root = env::current_dir().map_err(|error| {
+            RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "failed to read current directory: {error}"
+            ))
+        })?;
+        let mode = if is_beam_target(&options.target[0]) {
+            RuntimeMode::Beam
+        } else {
+            RuntimeMode::NonBeam
+        };
+        let source_paths = if mode == RuntimeMode::Beam {
+            discover_source_paths(&source_root)
+                .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let copied_sources = if mode == RuntimeMode::Beam {
+            copy_sources(&options.out_dir, &source_root, &source_paths)
+                .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let session_file = options.out_dir.join("runtime_session.jsonl");
+        let runtime_ebin = if mode == RuntimeMode::Beam {
+            Some(
+                compile_runtime_app(&options.out_dir, &options.target[0]).map_err(|error| {
+                    RecorderDiagnostic::runtime_bootstrap_failed(error.to_string())
+                })?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            mode,
+            session_file,
+            runtime_ebin,
+            source_root,
+            source_paths,
+            copied_sources,
+        })
+    }
+
+    fn prepare_target(&self, target: &[String]) -> Result<PreparedTarget, RecorderDiagnostic> {
+        if self.mode == RuntimeMode::NonBeam {
+            return Ok(PreparedTarget::plain(target.to_vec()));
+        }
+
+        let Some(runtime_ebin) = &self.runtime_ebin else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "missing compiled runtime ebin directory",
+            ));
+        };
+        let command_name = target_program_name(&target[0]);
+        match command_name.as_str() {
+            "mix" => self.prepare_mix_target(target, runtime_ebin),
+            "erl" => self.prepare_erl_target(target, runtime_ebin),
+            "rebar3" => Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "Rebar3 runtime injection decision: use the same -pa runtime ebin plus wrapper bootstrap policy as plain erl; dedicated Rebar3 task integration is deferred past M4",
+            )),
+            other => Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
+                "unsupported BEAM target for M4 runtime injection: {other}"
+            ))),
+        }
+    }
+
+    fn prepare_mix_target(
+        &self,
+        target: &[String],
+        _runtime_ebin: &Path,
+    ) -> Result<PreparedTarget, RecorderDiagnostic> {
+        let mut prepared = PreparedTarget::plain(target.to_vec());
+        let expression_index = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "-e" || arg == "--eval")
+            .ok_or_else(|| {
+                RecorderDiagnostic::runtime_bootstrap_failed(
+                    "M4 Mix injection requires a mix run -e/--eval target expression",
+                )
+            })?;
+        let Some(expression) = prepared.args.get(expression_index + 1).cloned() else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "Mix -e/--eval is missing an expression to wrap",
+            ));
+        };
+        prepared.args[expression_index + 1] = wrap_elixir_expression(&expression, self);
+        prepared.injection_decision =
+            "Mix M4 injection: wrap mix run -e/--eval with code.add_patha for the compiled runtime ebin plus start_session/stop_session".to_string();
+        Ok(prepared)
+    }
+
+    fn prepare_erl_target(
+        &self,
+        target: &[String],
+        runtime_ebin: &Path,
+    ) -> Result<PreparedTarget, RecorderDiagnostic> {
+        let mut args = target[1..].to_vec();
+        let Some((module, function)) = extract_erl_start_function(&mut args) else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "M4 plain erl injection requires a -s Module Function target entry point",
+            ));
+        };
+        remove_erl_init_stop(&mut args);
+        args.push("-pa".to_string());
+        args.push(runtime_ebin.display().to_string());
+        args.push("-eval".to_string());
+        args.push(wrap_erlang_entrypoint(&module, &function, self));
+
+        Ok(PreparedTarget {
+            command: target[0].clone(),
+            args,
+            env: Vec::new(),
+            injection_decision:
+                "plain erl M4 injection: add -pa compiled runtime ebin, replace -s entrypoint/-s init stop with an -eval wrapper that starts and stops the runtime session"
+                    .to_string(),
+        })
+    }
+
+    fn read_delivery(&self) -> Result<RuntimeDelivery, RecorderDiagnostic> {
+        if self.mode == RuntimeMode::NonBeam {
+            return Ok(RuntimeDelivery {
+                delivered: false,
+                thread_id: RUNTIME_THREAD_ID,
+                root_pid: None,
+            });
+        }
+
+        let text = fs::read_to_string(&self.session_file).map_err(|error| {
+            RecorderDiagnostic::writer_finalization_failed(format!(
+                "runtime session sidecar was not written at {}: {error}",
+                self.session_file.display()
+            ))
+        })?;
+        let mut saw_start = false;
+        let mut saw_switch = false;
+        let mut saw_exit = false;
+        let mut delivered = false;
+        let mut root_pid = None;
+        let mut thread_id = RUNTIME_THREAD_ID;
+
+        for (line_number, line) in text.lines().enumerate() {
+            let event: RuntimeSidecarEvent = serde_json::from_str(line).map_err(|error| {
+                RecorderDiagnostic::writer_finalization_failed(format!(
+                    "invalid runtime session JSON on line {}: {error}",
+                    line_number + 1
+                ))
+            })?;
+            match event.event.as_str() {
+                "thread_start" => {
+                    saw_start = true;
+                    thread_id = event.thread_id.unwrap_or(RUNTIME_THREAD_ID);
+                    root_pid = event.root_pid;
+                }
+                "thread_switch" => {
+                    saw_switch = true;
+                    thread_id = event.thread_id.unwrap_or(thread_id);
+                }
+                "thread_exit" => {
+                    saw_exit = true;
+                    thread_id = event.thread_id.unwrap_or(thread_id);
+                }
+                "trace_delivered" => delivered = true,
+                _ => {}
+            }
+        }
+
+        if !(saw_start && saw_switch && saw_exit && delivered) {
+            return Err(RecorderDiagnostic::writer_finalization_failed(format!(
+                "runtime session did not deliver required lifecycle events: start={saw_start}, switch={saw_switch}, exit={saw_exit}, delivered={delivered}"
+            )));
+        }
+
+        Ok(RuntimeDelivery {
+            delivered,
+            thread_id,
+            root_pid,
+        })
+    }
+}
+
+fn is_beam_target(target_command: &str) -> bool {
+    matches!(
+        target_program_name(target_command).as_str(),
+        "mix" | "erl" | "rebar3"
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeCompiler {
+    Erlc,
+    Elixir,
+}
+
+fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = repo_root.join("apps/codetracer_erlang_runtime/src");
+    let build_dir = out_dir.join("runtime").join(RUNTIME_APP_NAME);
+    let ebin_dir = build_dir.join("ebin");
+    fs::create_dir_all(&ebin_dir)?;
+    let compiler = if target_program_name(target_command) == "mix" {
+        RuntimeCompiler::Elixir
+    } else {
+        RuntimeCompiler::Erlc
+    };
+
+    for module in ["codetracer_erlang_runtime.erl", "codetracer_session.erl"] {
+        let source = src_dir.join(module);
+        let output = compile_erlang_runtime_source(&source, &ebin_dir, compiler)?;
+        if !output.status.success() {
+            return Err(format!(
+                "runtime compile {} failed with status {:?}\n{}{}",
+                source.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+    }
+
+    fs::copy(
+        src_dir.join(format!("{RUNTIME_APP_NAME}.app.src")),
+        ebin_dir.join(format!("{RUNTIME_APP_NAME}.app")),
+    )?;
+    Ok(ebin_dir)
+}
+
+fn compile_erlang_runtime_source(
+    source: &Path,
+    ebin_dir: &Path,
+    compiler: RuntimeCompiler,
+) -> io::Result<std::process::Output> {
+    match compiler {
+        RuntimeCompiler::Erlc => Command::new("erlc")
+            .arg("+debug_info")
+            .arg("-o")
+            .arg(ebin_dir)
+            .arg(source)
+            .output(),
+        RuntimeCompiler::Elixir => Command::new("elixir")
+            .arg("-e")
+            .arg(format!(
+                "case :compile.file({source}, [:debug_info, {{:outdir, {outdir}}}]) do {{:ok, _}} -> :ok; other -> raise inspect(other) end",
+                source = elixir_charlist(&source.display().to_string()),
+                outdir = elixir_charlist(&ebin_dir.display().to_string())
+            ))
+            .output(),
+    }
+}
+
+fn discover_source_paths(source_root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for dirname in ["lib", "src", "test"] {
+        let dir = source_root.join(dirname);
+        if dir.is_dir() {
+            collect_source_paths(&dir, &mut paths)?;
+        }
+    }
+    for filename in ["mix.exs", "rebar.config", "Makefile"] {
+        let file = source_root.join(filename);
+        if file.is_file() {
+            paths.push(file);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_source_paths(&path, paths)?;
+        } else if is_source_file(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("ex" | "exs" | "erl" | "hrl")
+    )
+}
+
+fn copy_sources(
+    out_dir: &Path,
+    source_root: &Path,
+    source_paths: &[PathBuf],
+) -> io::Result<Vec<CopiedSource>> {
+    let bundle_root = out_dir.join("source_map");
+    let mut copied = Vec::new();
+    for source_path in source_paths {
+        let relative = source_path.strip_prefix(source_root).unwrap_or(source_path);
+        let destination = bundle_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source_path, &destination)?;
+        copied.push(CopiedSource {
+            source_path: source_path.display().to_string(),
+            bundle_path: destination.display().to_string(),
+        });
+    }
+    Ok(copied)
+}
+
+fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String {
+    let runtime_ebin = runtime
+        .runtime_ebin
+        .as_ref()
+        .map(|path| elixir_charlist(&path.display().to_string()))
+        .unwrap_or_else(|| "~c\"\"".to_string());
+    format!(
+        ":code.add_patha({runtime_ebin})\n:ok = :codetracer_erlang_runtime.start_session({options})\ntry do\n  {expression}\nafter\n  :ok = :codetracer_erlang_runtime.stop_session(:normal)\nend",
+        runtime_ebin = runtime_ebin,
+        options = elixir_runtime_options(runtime)
+    )
+}
+
+fn wrap_erlang_entrypoint(module: &str, function: &str, runtime: &RuntimeSession) -> String {
+    format!(
+        "codetracer_erlang_runtime:start_session({options}), try apply({module}, {function}, []) of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        options = erlang_runtime_options(runtime),
+        module = erlang_atom(module),
+        function = erlang_atom(function)
+    )
+}
+
+fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
+    format!(
+        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}]",
+        session_file = elixir_charlist(&runtime.session_file.display().to_string()),
+        source_paths = elixir_charlist_list(&runtime.source_paths)
+    )
+}
+
+fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
+    format!(
+        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}}]",
+        session_file = erlang_string(&runtime.session_file.display().to_string()),
+        source_paths = erlang_string_list(&runtime.source_paths)
+    )
+}
+
+fn elixir_charlist_list(paths: &[PathBuf]) -> String {
+    let values = paths
+        .iter()
+        .map(|path| elixir_charlist(&path.display().to_string()))
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
+}
+
+fn erlang_string_list(paths: &[PathBuf]) -> String {
+    let values = paths
+        .iter()
+        .map(|path| erlang_string(&path.display().to_string()))
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(","))
+}
+
+fn elixir_charlist(value: &str) -> String {
+    format!("~c\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn erlang_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn erlang_atom(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
+
+fn extract_erl_start_function(args: &mut Vec<String>) -> Option<(String, String)> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "-s" {
+            let module = args.get(index + 1)?.clone();
+            let function = args
+                .get(index + 2)
+                .filter(|value| !value.starts_with('-'))
+                .cloned()
+                .unwrap_or_else(|| "start".to_string());
+            if module != "init" {
+                let remove_count = if args
+                    .get(index + 2)
+                    .is_some_and(|value| !value.starts_with('-'))
+                {
+                    3
+                } else {
+                    2
+                };
+                args.drain(index..index + remove_count);
+                return Some((module, function));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn remove_erl_init_stop(args: &mut Vec<String>) {
+    let mut index = 0;
+    while index + 2 < args.len() {
+        if args[index] == "-s" && args[index + 1] == "init" && args[index + 2] == "stop" {
+            args.drain(index..index + 3);
+        } else {
+            index += 1;
+        }
     }
 }
 
@@ -474,6 +988,8 @@ struct CompatibilityTraceMeta<'a> {
     subcommand: &'a str,
     target: CompatibilityTarget<'a>,
     artifacts: CompatibilityArtifacts,
+    runtime_session: CompatibilityRuntimeSession,
+    sources: &'a [CopiedSource],
 }
 
 #[derive(Serialize)]
@@ -491,33 +1007,55 @@ struct CompatibilityArtifacts {
     trace_paths: &'static str,
 }
 
+#[derive(Serialize)]
+struct CompatibilityRuntimeSession {
+    mode: &'static str,
+    delivered: bool,
+    root_thread_id: u64,
+    root_pid: Option<String>,
+    sidecar: String,
+    source_root: String,
+    injection_decision: String,
+}
+
 fn write_trace_meta_json(
-    out_dir: &Path,
-    program_name: &str,
-    subcommand: &str,
-    options: &RecordOptions,
+    session: &RecordingSession,
+    runtime_result: &RuntimeDelivery,
     target_exit_code: i32,
 ) -> Result<(), Box<dyn Error>> {
     let meta = CompatibilityTraceMeta {
         language: "elixir",
         recorder: BINARY_NAME,
         recorder_version: VERSION,
-        format: options.format.as_str(),
-        subcommand,
+        format: session.options.format.as_str(),
+        subcommand: session.subcommand,
         target: CompatibilityTarget {
-            command: &options.target[0],
-            args: &options.target[1..],
-            argv: &options.target,
+            command: &session.options.target[0],
+            args: &session.options.target[1..],
+            argv: &session.options.target,
             exit_code: target_exit_code,
         },
         artifacts: CompatibilityArtifacts {
-            ctfs: format!("{program_name}.ct"),
+            ctfs: format!("{}.ct", session.program_name),
             trace_metadata: "trace_metadata.json",
             trace_paths: "trace_paths.json",
         },
+        runtime_session: CompatibilityRuntimeSession {
+            mode: match session.runtime.mode {
+                RuntimeMode::Beam => "beam",
+                RuntimeMode::NonBeam => "non_beam",
+            },
+            delivered: runtime_result.delivered,
+            root_thread_id: runtime_result.thread_id,
+            root_pid: runtime_result.root_pid.clone(),
+            sidecar: session.runtime.session_file.display().to_string(),
+            source_root: session.runtime.source_root.display().to_string(),
+            injection_decision: session.prepared_target.injection_decision.clone(),
+        },
+        sources: &session.runtime.copied_sources,
     };
     let json = serde_json::to_vec_pretty(&meta)?;
-    fs::write(out_dir.join("trace_meta.json"), json)?;
+    fs::write(session.out_dir.join("trace_meta.json"), json)?;
     Ok(())
 }
 

@@ -1,0 +1,7 @@
+{application, codetracer_erlang_runtime,
+ [{description, "CodeTracer Erlang runtime session recorder"},
+  {vsn, "0.1.0"},
+  {registered, [codetracer_session]},
+  {applications, [kernel, stdlib]},
+  {mod, {codetracer_session, []}},
+  {modules, [codetracer_erlang_runtime, codetracer_session]}]}.
