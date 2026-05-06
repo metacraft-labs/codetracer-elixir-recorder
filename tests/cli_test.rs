@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codetracer_ctfs::CtfsReader;
-use codetracer_trace_types::ValueRecord;
+use codetracer_trace_types::{FullValueRecord, TraceLowLevelEvent, ValueRecord};
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use serde_json::Value;
 
@@ -664,6 +664,246 @@ fn sidecar_message_events(events: &[Value]) -> Vec<&Value> {
             )
         })
         .collect()
+}
+
+fn sidecar_variable_binds(out_dir: &Path) -> Vec<Value> {
+    runtime_sidecar_events(out_dir)
+        .into_iter()
+        .filter(|event| event["event"] == "variable_bind")
+        .collect()
+}
+
+fn sidecar_drop_events(out_dir: &Path) -> Vec<Value> {
+    runtime_sidecar_events(out_dir)
+        .into_iter()
+        .filter(|event| event["event"] == "drop_variables")
+        .collect()
+}
+
+fn assert_sidecar_binding(binds: &[Value], name: &str, value: i64) {
+    assert!(
+        binds.iter().any(|event| {
+            event["name"] == name
+                && event["value"].as_i64() == Some(value)
+                && event["frame_id"].as_u64().is_some()
+                && event["runtime_variable_id"].as_u64().is_some()
+                && event["slot_template"]
+                    .as_str()
+                    .is_some_and(|slot| slot.contains('#'))
+        }),
+        "missing sidecar variable binding {name}={value}: {binds:#?}"
+    );
+}
+
+fn reader_value_pairs(out_dir: &Path, trace_file: &str) -> Vec<(String, i64)> {
+    let reader = open_named_trace(out_dir, trace_file);
+    let varnames = (0..reader.varname_count())
+        .map(|id| reader.varname(id).expect("reader varname"))
+        .collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for step in 0..reader.step_count() {
+        let raw = reader.values_json(step).expect("reader values json");
+        let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        collect_reader_value_pairs(&json, &varnames, &mut pairs);
+    }
+    if pairs.is_empty() {
+        pairs.extend(raw_ctfs_value_pairs(out_dir, trace_file));
+    }
+    pairs
+}
+
+fn raw_ctfs_value_pairs(out_dir: &Path, trace_file: &str) -> Vec<(String, i64)> {
+    let ct_path = out_dir.join(trace_file);
+    let mut reader = CtfsReader::open(&ct_path).expect("open CTFS container");
+    let values = reader.read_file("values.dat").expect("read values.dat");
+    let offsets = reader.read_file("values.off").expect("read values.off");
+    let varnames = raw_ctfs_varnames(&mut reader);
+    let mut pairs = Vec::new();
+    for record in call_record_slices(&values, &offsets) {
+        if std::env::var("DEBUG_M9_VALUES").is_ok() {
+            eprintln!("value record bytes: {record:02x?}");
+        }
+        let nim_pairs = decode_nim_value_record(record, &varnames);
+        if !nim_pairs.is_empty() {
+            pairs.extend(nim_pairs);
+            continue;
+        }
+        if let Ok(full_values) =
+            cbor4ii::serde::from_reader::<Vec<FullValueRecord>, _>(Cursor::new(record))
+        {
+            for full in full_values {
+                if let Some(name) = varnames.get(full.variable_id.0) {
+                    if let Some(value) = value_record_int(&full.value) {
+                        pairs.push((name.clone(), value));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Ok(full) = cbor4ii::serde::from_reader::<FullValueRecord, _>(Cursor::new(record)) {
+            if let Some(name) = varnames.get(full.variable_id.0) {
+                if let Some(value) = value_record_int(&full.value) {
+                    pairs.push((name.clone(), value));
+                }
+            }
+            continue;
+        }
+        for offset in 0..record.len() {
+            if let Ok(full) =
+                cbor4ii::serde::from_reader::<FullValueRecord, _>(Cursor::new(&record[offset..]))
+            {
+                if let Some(name) = varnames.get(full.variable_id.0) {
+                    if let Some(value) = value_record_int(&full.value) {
+                        pairs.push((name.clone(), value));
+                    }
+                }
+                break;
+            }
+        }
+    }
+    pairs
+}
+
+fn decode_nim_value_record(record: &[u8], varnames: &[String]) -> Vec<(String, i64)> {
+    if record.len() < 5 || record[0] == 0 {
+        return Vec::new();
+    }
+    let count = usize::from(record[0]);
+    let mut cursor = 1;
+    let mut pairs = Vec::new();
+    for _ in 0..count {
+        if cursor + 3 > record.len() {
+            break;
+        }
+        let variable_id = usize::from(record[cursor]);
+        let cbor_len = usize::from(record[cursor + 2]);
+        let cbor_start = cursor + 3;
+        let cbor_end = cbor_start + cbor_len;
+        let Some(cbor) = record.get(cbor_start..cbor_end) else {
+            break;
+        };
+        if let Ok(json) = cbor4ii::serde::from_reader::<Value, _>(Cursor::new(cbor)) {
+            if let (Some(name), Some(value)) = (varnames.get(variable_id), reader_value_int(&json))
+            {
+                pairs.push((name.clone(), value));
+            }
+        }
+        cursor = cbor_end;
+    }
+    pairs
+}
+
+fn raw_ctfs_varnames(reader: &mut CtfsReader) -> Vec<String> {
+    let Ok(varnames) = reader.read_file("varnames.dat") else {
+        return Vec::new();
+    };
+    let Ok(offsets) = reader.read_file("varnames.off") else {
+        return Vec::new();
+    };
+    call_record_slices(&varnames, &offsets)
+        .into_iter()
+        .map(|record| String::from_utf8_lossy(record).to_string())
+        .collect()
+}
+
+fn raw_ctfs_drop_variable_names(out_dir: &Path, trace_file: &str) -> Vec<Vec<String>> {
+    let ct_path = out_dir.join(trace_file);
+    let events = codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(&ct_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "read raw CTFS low-level events from {}: {error}",
+                ct_path.display()
+            )
+        });
+    let mut varnames = Vec::new();
+    let mut drops = Vec::new();
+    for event in events {
+        match event {
+            TraceLowLevelEvent::VariableName(name) | TraceLowLevelEvent::Variable(name) => {
+                varnames.push(name);
+            }
+            TraceLowLevelEvent::DropVariables(variable_ids) => {
+                drops.push(
+                    variable_ids
+                        .into_iter()
+                        .map(|variable_id| {
+                            varnames
+                                .get(variable_id.0)
+                                .cloned()
+                                .unwrap_or_else(|| format!("<unknown:{}>", variable_id.0))
+                        })
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    drops
+}
+
+fn assert_raw_ctfs_drop(drops: &[Vec<String>], name: &str) {
+    assert!(
+        drops
+            .iter()
+            .any(|variables| variables.iter().any(|variable| variable == name)),
+        "missing raw CTFS DropVariables event for {name}: {drops:#?}"
+    );
+}
+
+fn value_record_int(value: &ValueRecord) -> Option<i64> {
+    match value {
+        ValueRecord::Int { i, .. } => Some(*i),
+        _ => None,
+    }
+}
+
+fn collect_reader_value_pairs(value: &Value, varnames: &[String], out: &mut Vec<(String, i64)>) {
+    match value {
+        Value::Object(map) => {
+            let variable_id = map
+                .get("variable_id")
+                .or_else(|| map.get("variableId"))
+                .and_then(Value::as_u64);
+            let value_int = map.get("value").and_then(reader_value_int);
+            if let (Some(variable_id), Some(value_int)) = (variable_id, value_int) {
+                if let Some(name) = varnames.get(variable_id as usize) {
+                    out.push((name.clone(), value_int));
+                }
+            }
+            for nested in map.values() {
+                collect_reader_value_pairs(nested, varnames, out);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                collect_reader_value_pairs(nested, varnames, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn reader_value_int(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::Object(map) => map
+            .get("i")
+            .or_else(|| map.get("Int"))
+            .and_then(Value::as_i64),
+        Value::Array(values) => values.iter().find_map(reader_value_int),
+        _ => None,
+    }
+}
+
+fn assert_reader_value(pairs: &[(String, i64)], name: &str, value: i64) {
+    assert!(
+        pairs.iter().any(
+            |(observed_name, observed_value)| observed_name == name && *observed_value == value
+        ),
+        "missing CTFS reader value {name}={value}: {pairs:#?}"
+    );
 }
 
 fn find_message_event<'a>(messages: &'a [&'a Value], direction: &str, tag: &str) -> &'a Value {
@@ -1510,6 +1750,169 @@ fn m8_e2e_tail_recursion_semantics_preserved() {
         !dump.contains("case count_down(N - 1, Acc + 1)")
             && !dump.contains("begin\n        count_down(N - 1, Acc + 1),"),
         "transformed forms must not add post-tail-call wrappers: {dump}"
+    );
+}
+
+#[test]
+fn e2e_clause_entry_bindings_match_golden() {
+    let recorded = record_erlang_canonical_function("m9-clause-entry-bindings", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(String::from_utf8_lossy(&recorded.output.stdout), "94\n");
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("A", 10),
+        ("B", 32),
+        ("SumVal", 42),
+        ("Doubled", 84),
+        ("FinalResult", 94),
+        ("Result", 94),
+    ] {
+        assert_sidecar_binding(&binds, name, value);
+    }
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "erl.ct");
+    for (name, value) in [
+        ("A", 10),
+        ("B", 32),
+        ("SumVal", 42),
+        ("Doubled", 84),
+        ("FinalResult", 94),
+        ("Result", 94),
+    ] {
+        assert_reader_value(&pairs, name, value);
+    }
+
+    let drops = sidecar_drop_events(&recorded.out_dir);
+    assert!(
+        drops.iter().any(|event| {
+            event["variables"].as_array().is_some_and(|variables| {
+                variables
+                    .iter()
+                    .any(|variable| variable["name"] == "FinalResult")
+            })
+        }) && drops.iter().any(|event| {
+            event["variables"].as_array().is_some_and(|variables| {
+                variables
+                    .iter()
+                    .any(|variable| variable["name"] == "Result")
+            })
+        }),
+        "frame exits should drop compute/0 and main/0 variables: {drops:#?}"
+    );
+
+    let raw_drops = raw_ctfs_drop_variable_names(&recorded.out_dir, "erl.ct");
+    assert_raw_ctfs_drop(&raw_drops, "FinalResult");
+    assert_raw_ctfs_drop(&raw_drops, "Result");
+}
+
+#[test]
+fn e2e_pattern_clause_selection_bindings() {
+    let recorded = record_erlang_branch_function("m9-pattern-clauses", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "branch-ok\n"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("Value", 1),
+        ("N", 7),
+        ("Quotient", 5),
+        ("C", 11),
+        ("X", 4),
+        ("E", 13),
+        ("F", 7),
+    ] {
+        assert_sidecar_binding(&binds, name, value);
+    }
+    assert!(
+        !binds.iter().any(|event| event["name"] == "_"),
+        "wildcard clauses must not create source-visible variable bindings: {binds:#?}"
+    );
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "erl.ct");
+    for (name, value) in [("N", 7), ("Quotient", 5), ("C", 11), ("X", 4)] {
+        assert_reader_value(&pairs, name, value);
+    }
+}
+
+#[test]
+fn e2e_variable_lifecycle_across_recursion() {
+    let recorded = record_erlang_tail_function("m9-recursion-lifecycle", "small");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(String::from_utf8_lossy(&recorded.output.stdout), "3\n");
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    let n_binds = binds
+        .iter()
+        .filter(|event| event["name"] == "N")
+        .collect::<Vec<_>>();
+    let n_frame_ids = n_binds
+        .iter()
+        .filter_map(|event| event["frame_id"].as_u64())
+        .collect::<std::collections::HashSet<_>>();
+    let n_runtime_ids = n_binds
+        .iter()
+        .filter_map(|event| event["runtime_variable_id"].as_u64())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        n_binds.len(),
+        3,
+        "N should bind once per recursive non-base frame: {binds:#?}"
+    );
+    assert_eq!(
+        n_frame_ids.len(),
+        3,
+        "N bindings should be frame-local: {n_binds:#?}"
+    );
+    assert_eq!(
+        n_runtime_ids.len(),
+        3,
+        "runtime variable ids should be frame-local: {n_binds:#?}"
+    );
+
+    let drops = sidecar_drop_events(&recorded.out_dir);
+    for bind in n_binds {
+        let runtime_id = bind["runtime_variable_id"]
+            .as_u64()
+            .expect("N runtime variable id");
+        assert!(
+            drops.iter().any(|drop| {
+                drop["variables"].as_array().is_some_and(|variables| {
+                    variables
+                        .iter()
+                        .any(|variable| variable["runtime_variable_id"].as_u64() == Some(runtime_id))
+                })
+            }),
+            "recursive runtime variable id {runtime_id} should be dropped on frame exit: {drops:#?}"
+        );
+    }
+
+    let raw_drops = raw_ctfs_drop_variable_names(&recorded.out_dir, "erl.ct");
+    let raw_n_drop_count = raw_drops
+        .iter()
+        .filter(|variables| variables.iter().any(|variable| variable == "N"))
+        .count();
+    assert_eq!(
+        raw_n_drop_count, 3,
+        "raw CTFS should expose one real DropVariables event for each recursive N frame: {raw_drops:#?}"
     );
 }
 

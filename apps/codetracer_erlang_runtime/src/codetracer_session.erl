@@ -4,7 +4,7 @@
 -behaviour(gen_server).
 
 -export([start/2, stop/1]).
--export([start_session/1, step/1, stop_session/1]).
+-export([start_session/1, step/1, bind_many/1, stop_session/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -13,6 +13,9 @@
     root_pid = undefined,
     root_thread_id = 1,
     pid_threads = #{},
+    pid_frames = #{},
+    next_frame_id = 1,
+    next_runtime_variable_id = 1,
     next_thread_id = 2,
     last_thread_id = undefined,
     exited_pids = #{},
@@ -49,6 +52,14 @@ step(LocationId) when is_integer(LocationId) ->
             gen_server:call(?MODULE, {step, self(), LocationId}, infinity)
     end.
 
+bind_many(Bindings) when is_list(Bindings) ->
+    case whereis(?MODULE) of
+        undefined ->
+            ok;
+        _Pid ->
+            gen_server:call(?MODULE, {bind_many, self(), Bindings}, infinity)
+    end.
+
 init([]) ->
     {ok, #state{}}.
 
@@ -79,6 +90,9 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
         root_pid = RootPidText,
         root_thread_id = ThreadId,
         pid_threads = #{RootPidText => ThreadId},
+        pid_frames = #{},
+        next_frame_id = 1,
+        next_runtime_variable_id = 1,
         next_thread_id = 2,
         last_thread_id = ThreadId,
         source_paths = SourcePaths,
@@ -120,6 +134,12 @@ handle_call({step, Pid, LocationId}, _From, State = #state{started = true, file 
     ok = file:write(File, Line),
     {reply, ok, NewState};
 handle_call({step, _Pid, _LocationId}, _From, State) ->
+    {reply, ok, State};
+handle_call({bind_many, Pid, Bindings}, _From, State = #state{started = true, file = File}) ->
+    {ThreadId, State1} = ensure_event_thread(File, Pid, State),
+    State2 = bind_variables(File, Pid, ThreadId, Bindings, State1),
+    {reply, ok, State2};
+handle_call({bind_many, _Pid, _Bindings}, _From, State) ->
     {reply, ok, State}.
 
 handle_cast(_Message, State) ->
@@ -289,12 +309,14 @@ drain_trace_messages(File, State) ->
     end.
 
 write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) ->
-    {ThreadId, State} = ensure_event_thread(File, Pid, State0),
-    Metadata = source_metadata(Module, Function, length(Args), State),
+    {ThreadId, State1} = ensure_event_thread(File, Pid, State0),
+    Metadata = source_metadata(Module, Function, length(Args), State1),
+    {FrameId, State} = push_frame(Pid, Metadata, State1),
     Line = [
         "{\"event\":\"call\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
         "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"frame_id\":", integer_to_list(FrameId), ",",
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(length(Args)), ",",
@@ -306,10 +328,12 @@ write_trace_message(File, {trace, Pid, call, {Module, Function, Args}}, State0) 
     {ok, State};
 write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, ReturnValue}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
+    {FrameInfo, State1} = pop_frame(Pid, State),
     Line = [
         "{\"event\":\"return_from\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
         "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"frame_id\":", json_nullable_integer(frame_id(FrameInfo)), ",",
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(Arity), ",",
@@ -317,13 +341,16 @@ write_trace_message(File, {trace, Pid, return_from, {Module, Function, Arity}, R
         "}\n"
     ],
     ok = file:write(File, Line),
-    {ok, State};
+    ok = write_drop_variables(File, Pid, ThreadId, FrameInfo),
+    {ok, State1};
 write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}, {Class, Reason}}, State0) ->
     {ThreadId, State} = ensure_event_thread(File, Pid, State0),
+    {FrameInfo, State1} = pop_frame(Pid, State),
     Line = [
         "{\"event\":\"exception_from\",",
         "\"pid\":", json_string(pid_to_list(Pid)), ",",
         "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"frame_id\":", json_nullable_integer(frame_id(FrameInfo)), ",",
         "\"module\":", json_string(atom_to_list(Module)), ",",
         "\"function\":", json_string(atom_to_list(Function)), ",",
         "\"arity\":", integer_to_list(Arity), ",",
@@ -333,7 +360,8 @@ write_trace_message(File, {trace, Pid, exception_from, {Module, Function, Arity}
         "}\n"
     ],
     ok = file:write(File, Line),
-    {ok, State};
+    ok = write_drop_variables(File, Pid, ThreadId, FrameInfo),
+    {ok, State1};
 write_trace_message(File, {trace, Pid, spawn, ChildPid, {Module, Function, Args}}, State0) ->
     {_ParentThreadId, State1} = ensure_event_thread(File, Pid, State0),
     {_ChildThreadId, State} = ensure_pid_thread(File, ChildPid, State1),
@@ -451,6 +479,139 @@ source_metadata(Module, Function, Arity, #state{manifest_index = ManifestIndex})
             resolution => "unknown_generated_fallback"
         }
     }).
+
+push_frame(Pid, Metadata, State = #state{pid_frames = PidFrames, next_frame_id = FrameId}) ->
+    PidText = pid_to_list(Pid),
+    Stack = maps:get(PidText, PidFrames, []),
+    FunctionKey = maps:get(function_key, Metadata, undefined),
+    Frame = #{
+        frame_id => FrameId,
+        function_key => FunctionKey,
+        variables => #{}
+    },
+    {FrameId, State#state{
+        pid_frames = maps:put(PidText, [Frame | Stack], PidFrames),
+        next_frame_id = FrameId + 1
+    }}.
+
+pop_frame(Pid, State = #state{pid_frames = PidFrames}) ->
+    PidText = pid_to_list(Pid),
+    case maps:get(PidText, PidFrames, []) of
+        [Frame | Rest] ->
+            {Frame, State#state{pid_frames = maps:put(PidText, Rest, PidFrames)}};
+        [] ->
+            {undefined, State}
+    end.
+
+frame_id(undefined) ->
+    undefined;
+frame_id(Frame) ->
+    maps:get(frame_id, Frame, undefined).
+
+bind_variables(_File, _Pid, _ThreadId, [], State) ->
+    State;
+bind_variables(File, Pid, ThreadId, Bindings, State0 = #state{pid_frames = PidFrames}) ->
+    PidText = pid_to_list(Pid),
+    case maps:get(PidText, PidFrames, []) of
+        [] ->
+            State0;
+        [Frame0 | Rest] ->
+            {Frame, State} =
+                lists:foldl(
+                    fun(Binding, {CurrentFrame, CurrentState}) ->
+                        bind_variable(File, PidText, ThreadId, Binding, CurrentFrame, CurrentState)
+                    end,
+                    {Frame0, State0},
+                    Bindings
+                ),
+            State#state{pid_frames = maps:put(PidText, [Frame | Rest], State#state.pid_frames)}
+    end.
+
+bind_variable(
+    File,
+    PidText,
+    ThreadId,
+    {Slot, Name, Value},
+    Frame,
+    State = #state{next_runtime_variable_id = NextVariableId}
+) when is_integer(Slot), is_list(Name) ->
+    FrameId = maps:get(frame_id, Frame),
+    FunctionKey = maps:get(function_key, Frame, undefined),
+    SlotTemplate = slot_template(FunctionKey, Slot),
+    Variables0 = maps:get(variables, Frame, #{}),
+    case maps:get(SlotTemplate, Variables0, undefined) of
+        undefined ->
+            RuntimeVariableId = NextVariableId,
+            VariableInfo = #{
+                runtime_variable_id => RuntimeVariableId,
+                slot => Slot,
+                slot_template => SlotTemplate,
+                name => Name
+            },
+            Variables = maps:put(SlotTemplate, VariableInfo, Variables0),
+            NewFrame = Frame#{variables => Variables},
+            NewState = State#state{next_runtime_variable_id = RuntimeVariableId + 1},
+            ok = write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value),
+            {NewFrame, NewState};
+        VariableInfo0 ->
+            VariableInfo = VariableInfo0#{name => Name},
+            Variables = maps:put(SlotTemplate, VariableInfo, Variables0),
+            NewFrame = Frame#{variables => Variables},
+            ok = write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value),
+            {NewFrame, State}
+    end;
+bind_variable(_File, _PidText, _ThreadId, _Binding, Frame, State) ->
+    {Frame, State}.
+
+slot_template(undefined, Slot) ->
+    "unknown#" ++ integer_to_list(Slot);
+slot_template(FunctionKey, Slot) ->
+    flatten_text(FunctionKey) ++ "#" ++ integer_to_list(Slot).
+
+write_variable_bind(File, PidText, ThreadId, FrameId, VariableInfo, Value) ->
+    Line = [
+        "{\"event\":\"variable_bind\",",
+        "\"schema\":\"codetracer.beam.variable-binding.v1\",",
+        "\"pid\":", json_string(PidText), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"frame_id\":", integer_to_list(FrameId), ",",
+        "\"runtime_variable_id\":", integer_to_list(maps:get(runtime_variable_id, VariableInfo)), ",",
+        "\"slot\":", integer_to_list(maps:get(slot, VariableInfo)), ",",
+        "\"slot_template\":", json_string(maps:get(slot_template, VariableInfo)), ",",
+        "\"name\":", json_string(maps:get(name, VariableInfo)), ",",
+        "\"value\":", json_term(Value),
+        "}\n"
+    ],
+    ok = file:write(File, Line).
+
+write_drop_variables(_File, _Pid, _ThreadId, undefined) ->
+    ok;
+write_drop_variables(File, Pid, ThreadId, Frame) ->
+    Variables = maps:values(maps:get(variables, Frame, #{})),
+    case Variables of
+        [] ->
+            ok;
+        _ ->
+            Line = [
+                "{\"event\":\"drop_variables\",",
+                "\"schema\":\"codetracer.beam.variable-binding.v1\",",
+                "\"pid\":", json_string(pid_to_list(Pid)), ",",
+                "\"thread_id\":", integer_to_list(ThreadId), ",",
+                "\"frame_id\":", integer_to_list(maps:get(frame_id, Frame)), ",",
+                "\"variables\":[", join_json([dropped_variable_json(Variable) || Variable <- Variables]), "]",
+                "}\n"
+            ],
+            ok = file:write(File, Line)
+    end.
+
+dropped_variable_json(VariableInfo) ->
+    [
+        "{\"runtime_variable_id\":", integer_to_list(maps:get(runtime_variable_id, VariableInfo)), ",",
+        "\"slot\":", integer_to_list(maps:get(slot, VariableInfo)), ",",
+        "\"slot_template\":", json_string(maps:get(slot_template, VariableInfo)), ",",
+        "\"name\":", json_string(maps:get(name, VariableInfo)),
+        "}"
+    ].
 
 source_metadata_json(Metadata) ->
     SourceLocation = maps:get(source_location, Metadata),
@@ -627,6 +788,13 @@ join_json_terms([Value]) ->
     json_term(Value);
 join_json_terms([Value | Rest]) ->
     [json_term(Value), ",", join_json_terms(Rest)].
+
+join_json([]) ->
+    "";
+join_json([Value]) ->
+    Value;
+join_json([Value | Rest]) ->
+    [Value, ",", join_json(Rest)].
 
 json_term(Value) when is_integer(Value) ->
     integer_to_list(Value);

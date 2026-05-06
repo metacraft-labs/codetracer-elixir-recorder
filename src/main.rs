@@ -7,9 +7,11 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus};
 
+use codetracer_ctfs::{ChunkedWriter, CompressionMethod, CtfsReader, CtfsWriter};
+use codetracer_trace_format_cbor_zstd::HEADERV1;
 use codetracer_trace_reader::{create_trace_reader, TraceEventsFileFormat as ReaderFormat};
 use codetracer_trace_types::{
-    EventLogKind, FunctionId, Line, TraceLowLevelEvent, TypeId, TypeKind, ValueRecord,
+    EventLogKind, FunctionId, Line, TraceLowLevelEvent, TypeId, TypeKind, ValueRecord, VariableId,
 };
 use codetracer_trace_writer::trace_writer::TraceWriter as RustTraceWriter;
 use codetracer_trace_writer_nim::{
@@ -382,6 +384,7 @@ struct RecordingSession {
     options: RecordOptions,
     runtime: RuntimeSession,
     prepared_target: PreparedTarget,
+    pending_drop_variable_names: Vec<Vec<String>>,
 }
 
 impl RecordingSession {
@@ -409,6 +412,7 @@ impl RecordingSession {
             options: options.clone(),
             runtime,
             prepared_target,
+            pending_drop_variable_names: Vec::new(),
         };
         session.initialize_writer()?;
         Ok(session)
@@ -482,6 +486,7 @@ impl RecordingSession {
         self.writer
             .close()
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))?;
+        self.write_ctfs_drop_variable_events()?;
 
         write_trace_meta_json(self, &runtime_result, target_exit_code)
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
@@ -590,6 +595,55 @@ impl RecordingSession {
                     self.writer
                         .register_return(ValueRecord::None { type_id: none_type });
                 }
+                RuntimeTraceEvent::VariableBind {
+                    frame_id,
+                    runtime_variable_id,
+                    slot,
+                    slot_template,
+                    name,
+                    value,
+                } => {
+                    self.writer.register_variable_with_full_value(
+                        name,
+                        json_to_trace_value(value, integer_type, raw_type, none_type),
+                    );
+                    let payload = serde_json::json!({
+                        "schema": "codetracer.beam.variable-binding.v1",
+                        "event": "variable_bind",
+                        "frame_id": frame_id,
+                        "runtime_variable_id": runtime_variable_id,
+                        "slot": slot,
+                        "slot_template": slot_template,
+                        "name": name,
+                    });
+                    self.writer.register_special_event(
+                        EventLogKind::TraceLogEvent,
+                        "beam_variable_binding",
+                        &payload.to_string(),
+                    );
+                }
+                RuntimeTraceEvent::DropVariables {
+                    frame_id,
+                    variables,
+                } => {
+                    let names = variables
+                        .iter()
+                        .map(|variable| variable.name.clone())
+                        .collect::<Vec<_>>();
+                    self.writer.drop_variables(&names);
+                    self.pending_drop_variable_names.push(names);
+                    let payload = serde_json::json!({
+                        "schema": "codetracer.beam.variable-binding.v1",
+                        "event": "drop_variables",
+                        "frame_id": frame_id,
+                        "variables": variables,
+                    });
+                    self.writer.register_special_event(
+                        EventLogKind::TraceLogEvent,
+                        "beam_variable_binding",
+                        &payload.to_string(),
+                    );
+                }
                 RuntimeTraceEvent::Exception {
                     module,
                     function,
@@ -628,6 +682,121 @@ impl RecordingSession {
 
         Ok(())
     }
+
+    fn write_ctfs_drop_variable_events(&self) -> Result<(), RecorderDiagnostic> {
+        if !matches!(
+            self.options.format,
+            OutputFormat::Ctfs | OutputFormat::Binary
+        ) || self.pending_drop_variable_names.is_empty()
+        {
+            return Ok(());
+        }
+
+        let trace_path = self.out_dir.join(format!("{}.ct", self.program_name));
+        append_drop_variables_to_ctfs(&trace_path, &self.pending_drop_variable_names)
+            .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
+    }
+}
+
+fn append_drop_variables_to_ctfs(
+    trace_path: &Path,
+    drop_variable_groups: &[Vec<String>],
+) -> Result<(), Box<dyn Error>> {
+    let mut reader = CtfsReader::open(trace_path)?;
+    let files = reader.list_files();
+    let has_events_log = files.iter().any(|name| name == "events.log");
+    let has_events_fmt = files.iter().any(|name| name == "events.fmt");
+    if has_events_log {
+        let format = reader.read_file("events.fmt")?;
+        if format.as_slice() != b"split-binary" {
+            return Err(format!(
+                "cannot append DropVariables to {}: unsupported events.fmt {:?}",
+                trace_path.display(),
+                String::from_utf8_lossy(&format)
+            )
+            .into());
+        }
+    }
+
+    let existing_events = if has_events_log {
+        codetracer_trace_reader::ctfs_reader::read_trace_from_ctfs(trace_path)?
+    } else {
+        Vec::new()
+    };
+    let mut variable_names = Vec::new();
+    for event in &existing_events {
+        match event {
+            TraceLowLevelEvent::VariableName(name) | TraceLowLevelEvent::Variable(name) => {
+                variable_names.push(name.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut variable_ids = variable_names
+        .iter()
+        .enumerate()
+        .map(|(id, name)| (name.clone(), VariableId(id)))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut events = Vec::new();
+    for group in drop_variable_groups {
+        let mut ids = Vec::new();
+        for name in group {
+            let id = if let Some(id) = variable_ids.get(name) {
+                *id
+            } else {
+                let id = VariableId(variable_names.len());
+                variable_names.push(name.clone());
+                variable_ids.insert(name.clone(), id);
+                events.push(TraceLowLevelEvent::VariableName(name.clone()));
+                id
+            };
+            ids.push(id);
+        }
+        if !ids.is_empty() {
+            events.push(TraceLowLevelEvent::DropVariables(ids));
+        }
+    }
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut encoded = Vec::new();
+    let mut event_sizes = Vec::new();
+    let mut first_geids = Vec::new();
+    let first_geid = existing_events.len() as u64;
+    for (index, event) in events.iter().enumerate() {
+        let start = encoded.len();
+        codetracer_trace_writer::split_binary::encode_event(event, &mut encoded)?;
+        event_sizes.push(encoded.len() - start);
+        first_geids.push(first_geid + index as u64);
+    }
+    let chunked = ChunkedWriter::new(CompressionMethod::Zstd, events.len()).write_chunked(
+        &encoded,
+        &event_sizes,
+        &first_geids,
+    )?;
+
+    let mut writer = CtfsWriter::open_append(trace_path)?;
+    let events_handle = if let Some(handle) = writer.find_file("events.log") {
+        handle
+    } else {
+        let handle = writer.add_file("events.log")?;
+        writer.write(handle, HEADERV1)?;
+        writer.sync_entry(handle)?;
+        handle
+    };
+    writer.write(events_handle, &chunked)?;
+    writer.sync_entry(events_handle)?;
+
+    if !has_events_fmt {
+        let format_handle = writer.add_file("events.fmt")?;
+        writer.write(format_handle, b"split-binary")?;
+        writer.sync_entry(format_handle)?;
+    }
+
+    writer.close()?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -713,6 +882,13 @@ struct RuntimeSidecarEvent {
     class: Option<String>,
     reason: Option<serde_json::Value>,
     reason_repr: Option<String>,
+    frame_id: Option<u64>,
+    runtime_variable_id: Option<u64>,
+    slot: Option<u32>,
+    slot_template: Option<String>,
+    name: Option<String>,
+    value: Option<serde_json::Value>,
+    variables: Option<Vec<RuntimeDroppedVariable>>,
     schema: Option<String>,
     direction: Option<String>,
     trace_tag: Option<String>,
@@ -748,6 +924,7 @@ struct TraceLocationSpec {
 struct InstrumentationArtifacts {
     ebin_dir: Option<PathBuf>,
     locations: Vec<TraceLocationSpec>,
+    variable_slot_templates: Vec<ManifestVariableSlotTemplate>,
     dumps: Vec<TransformedFormsDump>,
 }
 
@@ -756,6 +933,8 @@ struct StepLocationsFile {
     schema: String,
     module: String,
     source_path: String,
+    #[serde(default)]
+    variable_slot_templates: Vec<RawVariableSlotTemplate>,
     locations: Vec<RawStepLocation>,
 }
 
@@ -766,6 +945,14 @@ struct RawStepLocation {
     line: i64,
     column: Option<u32>,
     generated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVariableSlotTemplate {
+    function_key: String,
+    slot: u32,
+    name: String,
+    source: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -824,6 +1011,18 @@ enum RuntimeTraceEvent {
     Return {
         return_value: Option<serde_json::Value>,
     },
+    VariableBind {
+        frame_id: u64,
+        runtime_variable_id: u64,
+        slot: u32,
+        slot_template: String,
+        name: String,
+        value: serde_json::Value,
+    },
+    DropVariables {
+        frame_id: u64,
+        variables: Vec<RuntimeDroppedVariable>,
+    },
     Exception {
         module: String,
         function: String,
@@ -850,6 +1049,14 @@ struct BeamMessagePayload {
     message_format: String,
     message_repr: String,
     message_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RuntimeDroppedVariable {
+    runtime_variable_id: u64,
+    slot: u32,
+    slot_template: String,
+    name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1001,6 +1208,7 @@ impl RuntimeSession {
             InstrumentationArtifacts {
                 ebin_dir: None,
                 locations: Vec::new(),
+                variable_slot_templates: Vec::new(),
                 dumps: Vec::new(),
             }
         };
@@ -1010,6 +1218,7 @@ impl RuntimeSession {
                 &source_root,
                 &trace_functions,
                 &instrumentation.locations,
+                &instrumentation.variable_slot_templates,
                 &discovered_source_maps,
                 &instrumentation.dumps,
             )
@@ -1195,6 +1404,50 @@ impl RuntimeSession {
                 "return_from" => {
                     trace_events.push(RuntimeTraceEvent::Return {
                         return_value: event.return_value,
+                    });
+                }
+                "variable_bind" => {
+                    trace_events.push(RuntimeTraceEvent::VariableBind {
+                        frame_id: event.frame_id.ok_or_else(|| {
+                            RecorderDiagnostic::writer_finalization_failed(format!(
+                                "runtime sidecar line {} missing required field frame_id",
+                                line_number + 1
+                            ))
+                        })?,
+                        runtime_variable_id: event.runtime_variable_id.ok_or_else(|| {
+                            RecorderDiagnostic::writer_finalization_failed(format!(
+                                "runtime sidecar line {} missing required field runtime_variable_id",
+                                line_number + 1
+                            ))
+                        })?,
+                        slot: event.slot.ok_or_else(|| {
+                            RecorderDiagnostic::writer_finalization_failed(format!(
+                                "runtime sidecar line {} missing required field slot",
+                                line_number + 1
+                            ))
+                        })?,
+                        slot_template: require_optional_sidecar_string(
+                            event.slot_template,
+                            "slot_template",
+                            line_number + 1,
+                        )?,
+                        name: require_optional_sidecar_string(
+                            event.name,
+                            "name",
+                            line_number + 1,
+                        )?,
+                        value: event.value.unwrap_or(serde_json::Value::Null),
+                    });
+                }
+                "drop_variables" => {
+                    trace_events.push(RuntimeTraceEvent::DropVariables {
+                        frame_id: event.frame_id.ok_or_else(|| {
+                            RecorderDiagnostic::writer_finalization_failed(format!(
+                                "runtime sidecar line {} missing required field frame_id",
+                                line_number + 1
+                            ))
+                        })?,
+                        variables: event.variables.unwrap_or_default(),
                     });
                 }
                 "exception_from" => {
@@ -1630,6 +1883,7 @@ fn instrument_erlang_sources(
         return Ok(InstrumentationArtifacts {
             ebin_dir: None,
             locations: Vec::new(),
+            variable_slot_templates: Vec::new(),
             dumps: Vec::new(),
         });
     }
@@ -1643,6 +1897,7 @@ fn instrument_erlang_sources(
     fs::create_dir_all(&dumps_root)?;
 
     let mut locations = Vec::new();
+    let mut variable_slot_templates = Vec::new();
     let mut dumps = Vec::new();
 
     for source_path in erlang_sources {
@@ -1678,6 +1933,15 @@ fn instrument_erlang_sources(
             )
             .into());
         }
+
+        variable_slot_templates.extend(parsed.variable_slot_templates.into_iter().map(|slot| {
+            ManifestVariableSlotTemplate {
+                function_key: slot.function_key,
+                slot: slot.slot,
+                name: slot.name,
+                source: slot.source,
+            }
+        }));
 
         for raw in parsed.locations {
             let raw_source = normalize_build_path(Path::new(&raw.source_path));
@@ -1733,10 +1997,20 @@ fn instrument_erlang_sources(
             ))
     });
     locations.dedup_by_key(|location| location.location_id);
+    variable_slot_templates.sort_by(|left, right| {
+        (&left.function_key, left.slot, &left.name).cmp(&(
+            &right.function_key,
+            right.slot,
+            &right.name,
+        ))
+    });
+    variable_slot_templates
+        .dedup_by(|left, right| left.function_key == right.function_key && left.slot == right.slot);
 
     Ok(InstrumentationArtifacts {
         ebin_dir: Some(ebin_dir),
         locations,
+        variable_slot_templates,
         dumps,
     })
 }
@@ -1780,6 +2054,7 @@ fn write_recorder_metadata(
     source_root: &Path,
     trace_functions: &[TraceFunctionSpec],
     step_locations: &[TraceLocationSpec],
+    variable_slot_templates: &[ManifestVariableSlotTemplate],
     source_maps: &[SparseSourceMap],
     transformed_form_dumps: &[TransformedFormsDump],
 ) -> Result<(Vec<ManifestArtifact>, Vec<SourceMapArtifact>), Box<dyn Error>> {
@@ -1796,6 +2071,7 @@ fn write_recorder_metadata(
         &manifests_root,
         trace_functions,
         step_locations,
+        variable_slot_templates,
         &source_map_artifacts,
     )?;
     for dump in transformed_form_dumps {
@@ -1841,6 +2117,7 @@ fn write_module_manifests(
     manifests_root: &Path,
     trace_functions: &[TraceFunctionSpec],
     step_locations: &[TraceLocationSpec],
+    variable_slot_templates: &[ManifestVariableSlotTemplate],
     source_maps: &[SourceMapArtifact],
 ) -> Result<Vec<ManifestArtifact>, Box<dyn Error>> {
     let mut by_module: BTreeMap<String, Vec<TraceFunctionSpec>> = BTreeMap::new();
@@ -1903,6 +2180,38 @@ fn write_module_manifests(
                 },
             );
         }
+        let function_keys = functions
+            .iter()
+            .map(|function| function.function_key.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut slots = functions
+            .iter()
+            .flat_map(|function| {
+                (0..function.arity).map(|slot| ManifestVariableSlotTemplate {
+                    function_key: function.function_key.clone(),
+                    slot,
+                    name: format!("_arg{slot}"),
+                    source: "runtime_call_arg".to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        slots.extend(
+            variable_slot_templates
+                .iter()
+                .filter(|slot| function_keys.contains(&slot.function_key))
+                .cloned(),
+        );
+        slots.sort_by(|left, right| {
+            (&left.function_key, left.slot, &left.name).cmp(&(
+                &right.function_key,
+                right.slot,
+                &right.name,
+            ))
+        });
+        slots.dedup_by(|left, right| {
+            left.function_key == right.function_key && left.slot == right.slot
+        });
+
         let manifest = ModuleManifest {
             schema: "codetracer.beam.module-manifest.v1".to_string(),
             encoding: "json".to_string(),
@@ -1935,17 +2244,7 @@ fn write_module_manifests(
                     location_id: function.location_id,
                 })
                 .collect(),
-            variable_slot_templates: functions
-                .iter()
-                .flat_map(|function| {
-                    (0..function.arity).map(|slot| ManifestVariableSlotTemplate {
-                        function_key: function.function_key.clone(),
-                        slot,
-                        name: format!("_arg{slot}"),
-                        source: "runtime_call_arg".to_string(),
-                    })
-                })
-                .collect(),
+            variable_slot_templates: slots,
             traceable_mfas: functions
                 .iter()
                 .map(|function| ManifestMfa {
