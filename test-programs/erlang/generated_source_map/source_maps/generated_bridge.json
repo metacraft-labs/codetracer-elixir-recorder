@@ -12,11 +12,53 @@
       "reason": "generated function body maps to original Elixir compute/0"
     },
     {
+      "generated_line": 5,
+      "generated_column": null,
+      "original_line": 5,
+      "original_column": null,
+      "reason": "generated assignment maps to original Elixir a binding"
+    },
+    {
+      "generated_line": 6,
+      "generated_column": null,
+      "original_line": 6,
+      "original_column": null,
+      "reason": "generated assignment maps to original Elixir b binding"
+    },
+    {
+      "generated_line": 7,
+      "generated_column": null,
+      "original_line": 7,
+      "original_column": null,
+      "reason": "generated expression maps to original Elixir arithmetic return"
+    },
+    {
       "generated_line": 9,
       "generated_column": null,
       "original_line": 10,
       "original_column": null,
       "reason": "generated function body maps to original Elixir main/0"
+    },
+    {
+      "generated_line": 10,
+      "generated_column": null,
+      "original_line": 11,
+      "original_column": null,
+      "reason": "generated call maps to original Elixir compute call"
+    },
+    {
+      "generated_line": 11,
+      "generated_column": null,
+      "original_line": 12,
+      "original_column": null,
+      "reason": "generated output maps to original Elixir IO.puts"
+    },
+    {
+      "generated_line": 12,
+      "generated_column": null,
+      "original_line": 13,
+      "original_column": null,
+      "reason": "generated return maps to original Elixir result return"
     }
   ]
 }

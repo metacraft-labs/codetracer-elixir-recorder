@@ -114,6 +114,32 @@ fn compile_erlang_spawn_fixture(ebin_dir: &Path) {
     assert_success(&compile, &format!("erlc {}", source.display()));
 }
 
+fn compile_erlang_tail_fixture(ebin_dir: &Path) {
+    fs::create_dir_all(ebin_dir).expect("create tail fixture ebin dir");
+    let source = repo_root().join("test-programs/erlang/tail_recursion/src/tail_recursion.erl");
+    let compile = Command::new("erlc")
+        .arg("+debug_info")
+        .arg("-o")
+        .arg(ebin_dir)
+        .arg(&source)
+        .output()
+        .expect("run erlc for tail_recursion");
+    assert_success(&compile, &format!("erlc {}", source.display()));
+}
+
+fn compile_erlang_branch_fixture(ebin_dir: &Path) {
+    fs::create_dir_all(ebin_dir).expect("create branch fixture ebin dir");
+    let source = repo_root().join("test-programs/erlang/branch_forms/src/branch_forms.erl");
+    let compile = Command::new("erlc")
+        .arg("+debug_info")
+        .arg("-o")
+        .arg(ebin_dir)
+        .arg(&source)
+        .output()
+        .expect("run erlc for branch_forms");
+    assert_success(&compile, &format!("erlc {}", source.display()));
+}
+
 fn compile_erlang_generated_source_map_fixture(ebin_dir: &Path) {
     fs::create_dir_all(ebin_dir).expect("create generated source-map fixture ebin dir");
     let source =
@@ -190,6 +216,38 @@ fn record_elixir_fixture_expression(
     RecordedTrace { out_dir, output }
 }
 
+fn record_erlang_canonical_function(label: &str, function: &str) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/canonical_flow");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_fixture(&ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "canonical_flow",
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Erlang canonical fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
 fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
     let tmp = temp_dir(label);
     let out_dir = tmp.join("trace");
@@ -218,6 +276,70 @@ fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
         .env("TMPDIR", tmp.to_str().unwrap())
         .output()
         .expect("run Erlang spawn fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
+fn record_erlang_tail_function(label: &str, function: &str) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/tail_recursion");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_tail_fixture(&ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "tail_recursion",
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Erlang tail fixture under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
+fn record_erlang_branch_function(label: &str, function: &str) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang/branch_forms");
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_branch_fixture(&ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            "branch_forms",
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Erlang branch fixture under runtime session");
 
     RecordedTrace { out_dir, output }
 }
@@ -301,6 +423,95 @@ fn manifest_jsons(out_dir: &Path) -> Vec<Value> {
             serde_json::from_str(&text).expect("manifest JSON")
         })
         .collect()
+}
+
+fn step_location_jsons(out_dir: &Path) -> Vec<Value> {
+    let root = out_dir.join("recorder_metadata/step_locations");
+    let mut paths = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        .map(|entry| entry.expect("step location entry").path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            serde_json::from_str(&text).expect("step locations JSON")
+        })
+        .collect()
+}
+
+fn manifest_location_index(
+    out_dir: &Path,
+) -> std::collections::HashMap<u64, (String, i64, String)> {
+    let mut index = std::collections::HashMap::new();
+    for manifest in manifest_jsons(out_dir) {
+        let Some(locations) = manifest["locations"].as_array() else {
+            continue;
+        };
+        for location in locations {
+            let id = location["id"].as_u64().expect("manifest location id");
+            let trace_copy_path = location["trace_copy_path"]
+                .as_str()
+                .expect("manifest trace copy path")
+                .to_string();
+            let line = location["line"].as_i64().expect("manifest location line");
+            let resolution = location["resolution"]
+                .as_str()
+                .expect("manifest location resolution")
+                .to_string();
+            index.insert(id, (trace_copy_path, line, resolution));
+        }
+    }
+    index
+}
+
+fn sidecar_step_locations(out_dir: &Path) -> Vec<(String, i64, String)> {
+    let locations = manifest_location_index(out_dir);
+    runtime_sidecar_events(out_dir)
+        .into_iter()
+        .filter(|event| event["event"] == "step")
+        .map(|event| {
+            let id = event["location_id"].as_u64().expect("step location_id");
+            locations
+                .get(&id)
+                .unwrap_or_else(|| panic!("step location_id {id} missing from manifests"))
+                .clone()
+        })
+        .collect()
+}
+
+fn assert_ordered_subsequence(observed: &[i64], expected: &[i64]) {
+    let mut cursor = 0;
+    for line in observed {
+        if expected.get(cursor) == Some(line) {
+            cursor += 1;
+            if cursor == expected.len() {
+                return;
+            }
+        }
+    }
+    panic!("missing ordered line subsequence {expected:?} in observed lines {observed:?}");
+}
+
+fn transformed_dump_text(out_dir: &Path, suffix: &str) -> String {
+    let root = out_dir.join("recorder_metadata/transformed_forms");
+    let path = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("read transformed dumps {}: {error}", root.display()))
+        .map(|entry| entry.expect("transformed dump entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing transformed dump ending in {suffix} under {}",
+                root.display()
+            )
+        });
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
 fn raw_ctfs_call_return_values(out_dir: &Path) -> Vec<String> {
@@ -1103,6 +1314,202 @@ fn e2e_source_map_sparse_override_real_trace() {
             .iter()
             .any(|path| path.ends_with("lib/original_generated.ex")),
         "reader/raw CTFS-visible paths should include original source from source-map resolution: {paths:#?}"
+    );
+}
+
+#[test]
+fn m8_e2e_instrumented_erlang_steps_match_golden() {
+    let recorded = record_erlang_canonical_function("m8-erlang-steps", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(String::from_utf8_lossy(&recorded.output.stdout), "94\n");
+
+    let observed = sidecar_step_locations(&recorded.out_dir)
+        .into_iter()
+        .filter(|(path, _, _)| path == "files/src/canonical_flow.erl")
+        .map(|(_, line, resolution)| (line, resolution))
+        .collect::<Vec<_>>();
+    let expected = [14, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17]
+        .into_iter()
+        .map(|line| (line, "erl_anno".to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed, expected,
+        "instrumented Erlang step sequence should match first-principles executable source lines"
+    );
+
+    let step_location_files = step_location_jsons(&recorded.out_dir);
+    let canonical_steps = step_location_files
+        .iter()
+        .find(|locations| locations["module"] == "canonical_flow")
+        .unwrap_or_else(|| {
+            panic!("missing canonical_flow step locations: {step_location_files:#?}")
+        });
+    assert!(
+        canonical_steps["locations"].as_array().is_some_and(|locations| {
+            locations.iter().all(|location| {
+                location["file"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("src/canonical_flow.erl"))
+                    && location["column"].as_i64().is_some()
+                    && location["generated"] == false
+            })
+        }),
+        "raw step-location metadata should preserve erl_anno file/column/generated flags: {canonical_steps:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    assert!(
+        reader.step_count() >= expected.len() as u64,
+        "real CTFS reader should expose at least the instrumented source steps"
+    );
+
+    let dump = transformed_dump_text(&recorded.out_dir, "src_canonical_flow.erl.transformed.erl");
+    assert!(
+        dump.starts_with(
+            "%% codetracer transformed forms dump format: erl_pp:form/1 pretty-printed Erlang source"
+        ) && dump.contains("codetracer_erlang_runtime:step("),
+        "transformed forms dump should use the reviewed pretty-printed Erlang format: {dump}"
+    );
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["transformed_form_dumps"]
+            .as_array()
+            .is_some_and(|dumps| {
+                dumps.iter().any(|dump| {
+                    dump["module"] == "canonical_flow"
+                        && dump["format"] == "erl_pp:form/1 pretty-printed Erlang source"
+                        && dump["trace_copy_path"].as_str().is_some_and(|path| {
+                            path.ends_with("src_canonical_flow.erl.transformed.erl")
+                        })
+                })
+            }),
+        "trace metadata should expose transformed-form debug dumps: {meta:#?}"
+    );
+}
+
+#[test]
+fn m8_e2e_instrumented_elixir_generated_steps_match_original_source() {
+    let recorded = record_erlang_generated_source_map_function("m8-elixir-generated-steps", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "mapped-ok:42\n"
+    );
+
+    let observed = sidecar_step_locations(&recorded.out_dir)
+        .into_iter()
+        .filter(|(path, _, resolution)| {
+            path == "files/lib/original_generated.ex" && resolution == "source_map"
+        })
+        .map(|(_, line, _)| line)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![11, 5, 6, 7, 12, 13],
+        "generated Erlang steps should resolve to original Elixir source-map lines"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("lib/original_generated.ex")),
+        "CTFS paths should include original Elixir source for generated Erlang steps: {paths:#?}"
+    );
+}
+
+#[test]
+fn m8_e2e_branch_body_entries_for_control_flow_forms() {
+    let recorded = record_erlang_branch_function("m8-branch-forms", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "branch-ok\n"
+    );
+
+    let observed = sidecar_step_locations(&recorded.out_dir)
+        .into_iter()
+        .filter(|(path, _, resolution)| {
+            path == "files/src/branch_forms.erl" && resolution == "erl_anno"
+        })
+        .map(|(_, line, _)| line)
+        .collect::<Vec<_>>();
+    assert_ordered_subsequence(&observed, &[5, 7, 13, 15, 22, 24, 30, 31, 34, 39]);
+
+    let dump = transformed_dump_text(&recorded.out_dir, "src_branch_forms.erl.transformed.erl");
+    for branch_entry in [
+        "1 ->\n            codetracer_erlang_runtime:step(",
+        "Value > 0 ->\n            codetracer_erlang_runtime:step(",
+        "{branch_msg, N} ->\n            codetracer_erlang_runtime:step(",
+        "try\n        codetracer_erlang_runtime:step(",
+        "Quotient ->\n            codetracer_erlang_runtime:step(",
+        "after\n        codetracer_erlang_runtime:step(",
+    ] {
+        assert!(
+            dump.contains(branch_entry),
+            "transformed forms should contain branch/body entry marker {branch_entry:?}: {dump}"
+        );
+    }
+}
+
+#[test]
+fn m8_e2e_tail_recursion_semantics_preserved() {
+    let tmp = temp_dir("m8-tail-original");
+    let original_ebin = tmp.join("original-ebin");
+    compile_erlang_tail_fixture(&original_ebin);
+    let original = Command::new("erl")
+        .args([
+            "-noshell",
+            "-pa",
+            original_ebin.to_str().unwrap(),
+            "-s",
+            "tail_recursion",
+            "main",
+            "-s",
+            "init",
+            "stop",
+        ])
+        .output()
+        .expect("run original tail recursion fixture");
+    assert_success(&original, "original tail recursion fixture");
+    assert_eq!(String::from_utf8_lossy(&original.stdout), "5000\n");
+
+    let recorded = record_erlang_tail_function("m8-tail-instrumented", "main");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(String::from_utf8_lossy(&recorded.output.stdout), "5000\n");
+
+    let dump = transformed_dump_text(&recorded.out_dir, "src_tail_recursion.erl.transformed.erl");
+    assert!(
+        dump.contains("count_down(N - 1, Acc + 1)."),
+        "tail-recursive call should remain the final expression in its clause: {dump}"
+    );
+    assert!(
+        !dump.contains("case count_down(N - 1, Acc + 1)")
+            && !dump.contains("begin\n        count_down(N - 1, Acc + 1),"),
+        "transformed forms must not add post-tail-call wrappers: {dump}"
     );
 }
 

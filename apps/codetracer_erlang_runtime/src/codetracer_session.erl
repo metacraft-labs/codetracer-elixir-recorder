@@ -4,7 +4,7 @@
 -behaviour(gen_server).
 
 -export([start/2, stop/1]).
--export([start_session/1, stop_session/1]).
+-export([start_session/1, step/1, stop_session/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -39,6 +39,14 @@ stop_session(Reason) ->
     case whereis(?MODULE) of
         undefined -> ok;
         _Pid -> gen_server:call(?MODULE, {stop_session, Reason}, infinity)
+    end.
+
+step(LocationId) when is_integer(LocationId) ->
+    case whereis(?MODULE) of
+        undefined ->
+            ok;
+        _Pid ->
+            gen_server:call(?MODULE, {step, self(), LocationId}, infinity)
     end.
 
 init([]) ->
@@ -99,6 +107,19 @@ handle_call({stop_session, Reason}, _From, State = #state{started = true, file =
     ok = file:close(File),
     {reply, ok, #state{}};
 handle_call({stop_session, _Reason}, _From, State) ->
+    {reply, ok, State};
+handle_call({step, Pid, LocationId}, _From, State = #state{started = true, file = File}) ->
+    {ThreadId, NewState} = ensure_event_thread(File, Pid, State),
+    Line = [
+        "{\"event\":\"step\",",
+        "\"pid\":", json_string(pid_to_list(Pid)), ",",
+        "\"thread_id\":", integer_to_list(ThreadId), ",",
+        "\"location_id\":", integer_to_list(LocationId),
+        "}\n"
+    ],
+    ok = file:write(File, Line),
+    {reply, ok, NewState};
+handle_call({step, _Pid, _LocationId}, _From, State) ->
     {reply, ok, State}.
 
 handle_cast(_Message, State) ->

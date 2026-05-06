@@ -4,4 +4,4 @@
   {registered, [codetracer_session]},
   {applications, [kernel, stdlib]},
   {mod, {codetracer_session, []}},
-  {modules, [codetracer_erlang_runtime, codetracer_session]}]}.
+  {modules, [codetracer_erlang_runtime, codetracer_session, codetracer_forms]}]}.

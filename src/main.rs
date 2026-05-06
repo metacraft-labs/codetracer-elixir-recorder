@@ -492,6 +492,12 @@ impl RecordingSession {
         runtime_result: &RuntimeDelivery,
     ) -> Result<(), RecorderDiagnostic> {
         let mut interner = FunctionInterner::new(&self.runtime.trace_functions);
+        let location_index = self
+            .runtime
+            .step_locations
+            .iter()
+            .map(|location| (location.location_id, location))
+            .collect::<HashMap<_, _>>();
         let integer_type = self.writer.ensure_type_id(TypeKind::Int, "integer");
         let raw_type = self.writer.ensure_type_id(TypeKind::Raw, "term");
         let none_type = self.writer.ensure_type_id(TypeKind::None, "None");
@@ -556,6 +562,17 @@ impl RecordingSession {
                     }
                     self.writer.register_call(function_id, args);
                 }
+                RuntimeTraceEvent::Step { location_id } => {
+                    let Some(location) = location_index.get(location_id) else {
+                        return Err(RecorderDiagnostic::writer_finalization_failed(format!(
+                            "runtime emitted step for unknown location_id {location_id}"
+                        )));
+                    };
+                    self.writer.register_step(
+                        &location.resolved_source_path,
+                        Line(location.resolved_line),
+                    );
+                }
                 RuntimeTraceEvent::Return {
                     return_value: Some(value),
                     ..
@@ -618,12 +635,15 @@ struct RuntimeSession {
     mode: RuntimeMode,
     session_file: PathBuf,
     runtime_ebin: Option<PathBuf>,
+    instrumented_ebin: Option<PathBuf>,
     source_root: PathBuf,
     source_paths: Vec<PathBuf>,
     copied_sources: Vec<CopiedSource>,
     manifests: Vec<ManifestArtifact>,
     source_maps: Vec<SourceMapArtifact>,
+    transformed_form_dumps: Vec<TransformedFormsDump>,
     trace_functions: Vec<TraceFunctionSpec>,
+    step_locations: Vec<TraceLocationSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -659,6 +679,16 @@ struct SourceMapArtifact {
     generated_build_path: String,
     original_build_path: String,
     trace_copy_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TransformedFormsDump {
+    module: String,
+    format: String,
+    build_path: String,
+    trace_copy_path: String,
+    #[serde(skip_serializing)]
+    runtime_path: String,
 }
 
 #[derive(Debug)]
@@ -699,6 +729,43 @@ struct RuntimeSidecarEvent {
     location_id: Option<u32>,
     clause_id: Option<u32>,
     source_location: Option<ResolvedSourceLocation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TraceLocationSpec {
+    module: String,
+    source_path: PathBuf,
+    location_id: u32,
+    resolved_source_path: PathBuf,
+    resolved_line: i64,
+    resolved_column: Option<u32>,
+    resolution_strategy: String,
+    trace_copy_path: String,
+    generated: bool,
+}
+
+#[derive(Debug)]
+struct InstrumentationArtifacts {
+    ebin_dir: Option<PathBuf>,
+    locations: Vec<TraceLocationSpec>,
+    dumps: Vec<TransformedFormsDump>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StepLocationsFile {
+    schema: String,
+    module: String,
+    source_path: String,
+    locations: Vec<RawStepLocation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStepLocation {
+    id: u32,
+    source_path: String,
+    line: i64,
+    column: Option<u32>,
+    generated: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -750,6 +817,9 @@ enum RuntimeTraceEvent {
         location_id: Option<u32>,
         clause_id: Option<u32>,
         source_location: Option<ResolvedSourceLocation>,
+    },
+    Step {
+        location_id: u32,
     },
     Return {
         return_value: Option<serde_json::Value>,
@@ -903,17 +973,6 @@ impl RuntimeSession {
         } else {
             Vec::new()
         };
-        let (manifests, source_maps) = if mode == RuntimeMode::Beam {
-            write_recorder_metadata(
-                &options.out_dir,
-                &source_root,
-                &trace_functions,
-                &discovered_source_maps,
-            )
-            .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
-        } else {
-            (Vec::new(), Vec::new())
-        };
         let session_file = options.out_dir.join("runtime_session.jsonl");
         let runtime_ebin = if mode == RuntimeMode::Beam {
             Some(
@@ -924,17 +983,54 @@ impl RuntimeSession {
         } else {
             None
         };
+        let instrumentation = if mode == RuntimeMode::Beam {
+            let runtime_ebin = runtime_ebin.as_ref().ok_or_else(|| {
+                RecorderDiagnostic::runtime_bootstrap_failed(
+                    "missing compiled runtime ebin before instrumentation",
+                )
+            })?;
+            instrument_erlang_sources(
+                &options.out_dir,
+                &source_root,
+                &source_paths,
+                runtime_ebin,
+                &discovered_source_maps,
+            )
+            .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            InstrumentationArtifacts {
+                ebin_dir: None,
+                locations: Vec::new(),
+                dumps: Vec::new(),
+            }
+        };
+        let (manifests, source_maps) = if mode == RuntimeMode::Beam {
+            write_recorder_metadata(
+                &options.out_dir,
+                &source_root,
+                &trace_functions,
+                &instrumentation.locations,
+                &discovered_source_maps,
+                &instrumentation.dumps,
+            )
+            .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         Ok(Self {
             mode,
             session_file,
             runtime_ebin,
+            instrumented_ebin: instrumentation.ebin_dir,
             source_root,
             source_paths,
             copied_sources,
             manifests,
             source_maps,
+            transformed_form_dumps: instrumentation.dumps,
             trace_functions,
+            step_locations: instrumentation.locations,
         })
     }
 
@@ -1001,6 +1097,10 @@ impl RuntimeSession {
         remove_erl_init_stop(&mut args);
         args.push("-pa".to_string());
         args.push(runtime_ebin.display().to_string());
+        if let Some(instrumented_ebin) = &self.instrumented_ebin {
+            args.push("-pa".to_string());
+            args.push(instrumented_ebin.display().to_string());
+        }
         args.push("-eval".to_string());
         args.push(wrap_erlang_entrypoint(&module, &function, self));
 
@@ -1009,7 +1109,7 @@ impl RuntimeSession {
             args,
             env: Vec::new(),
             injection_decision:
-                "plain erl M4 injection: add -pa compiled runtime ebin, replace -s entrypoint/-s init stop with an -eval wrapper that starts and stops the runtime session"
+                "plain erl M4 injection plus M8 instrumentation: add -pa compiled runtime ebin and instrumented ebin, replace -s entrypoint/-s init stop with an -eval wrapper that starts and stops the runtime session"
                     .to_string(),
         })
     }
@@ -1069,6 +1169,16 @@ impl RuntimeSession {
                     trace_events.push(RuntimeTraceEvent::ThreadExit { thread_id });
                 }
                 "trace_delivered" => delivered = true,
+                "step" => {
+                    trace_events.push(RuntimeTraceEvent::Step {
+                        location_id: event.location_id.ok_or_else(|| {
+                            RecorderDiagnostic::writer_finalization_failed(format!(
+                                "runtime sidecar line {} missing required field location_id",
+                                line_number + 1
+                            ))
+                        })?,
+                    });
+                }
                 "call" => {
                     trace_events.push(RuntimeTraceEvent::Call {
                         module: require_sidecar_string(&event, "module", line_number + 1)?,
@@ -1366,7 +1476,11 @@ fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, 
         RuntimeCompiler::Erlc
     };
 
-    for module in ["codetracer_erlang_runtime.erl", "codetracer_session.erl"] {
+    for module in [
+        "codetracer_erlang_runtime.erl",
+        "codetracer_session.erl",
+        "codetracer_forms.erl",
+    ] {
         let source = src_dir.join(module);
         let output = compile_erlang_runtime_source(&source, &ebin_dir, compiler)?;
         if !output.status.success() {
@@ -1501,11 +1615,173 @@ fn collect_json_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+fn instrument_erlang_sources(
+    out_dir: &Path,
+    source_root: &Path,
+    source_paths: &[PathBuf],
+    runtime_ebin: &Path,
+    source_maps: &[SparseSourceMap],
+) -> Result<InstrumentationArtifacts, Box<dyn Error>> {
+    let erlang_sources = source_paths
+        .iter()
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("erl"))
+        .collect::<Vec<_>>();
+    if erlang_sources.is_empty() {
+        return Ok(InstrumentationArtifacts {
+            ebin_dir: None,
+            locations: Vec::new(),
+            dumps: Vec::new(),
+        });
+    }
+
+    let instrumented_root = out_dir.join("instrumented");
+    let ebin_dir = instrumented_root.join("ebin");
+    let locations_root = out_dir.join("recorder_metadata").join("step_locations");
+    let dumps_root = out_dir.join("recorder_metadata").join("transformed_forms");
+    fs::create_dir_all(&ebin_dir)?;
+    fs::create_dir_all(&locations_root)?;
+    fs::create_dir_all(&dumps_root)?;
+
+    let mut locations = Vec::new();
+    let mut dumps = Vec::new();
+
+    for source_path in erlang_sources {
+        let source_path = normalize_build_path(source_path);
+        let relative = project_relative_path(source_root, &source_path);
+        let safe = safe_filename(&relative.replace(['/', '\\'], "_"));
+        let locations_path = locations_root.join(format!("{safe}.step-locations.json"));
+        let dump_path = dumps_root.join(format!("{safe}.transformed.erl"));
+        run_forms_instrumenter(
+            runtime_ebin,
+            &source_path,
+            &ebin_dir,
+            &locations_path,
+            &dump_path,
+        )?;
+
+        let text = fs::read_to_string(&locations_path)?;
+        let parsed: StepLocationsFile = serde_json::from_str(&text)?;
+        if parsed.schema != "codetracer.beam.step-locations.v1" {
+            return Err(format!(
+                "unsupported step location schema {} in {}",
+                parsed.schema,
+                locations_path.display()
+            )
+            .into());
+        }
+        let parsed_source = normalize_build_path(Path::new(&parsed.source_path));
+        if parsed_source != source_path {
+            return Err(format!(
+                "instrumenter reported source {} for {}",
+                parsed.source_path,
+                source_path.display()
+            )
+            .into());
+        }
+
+        for raw in parsed.locations {
+            let raw_source = normalize_build_path(Path::new(&raw.source_path));
+            let resolved = resolve_source_location(
+                source_root,
+                source_maps,
+                &raw_source,
+                raw.line,
+                raw.column,
+            );
+            locations.push(TraceLocationSpec {
+                module: parsed.module.clone(),
+                source_path: raw_source,
+                location_id: raw.id,
+                resolved_source_path: PathBuf::from(&resolved.build_path),
+                resolved_line: resolved.line,
+                resolved_column: resolved.column,
+                resolution_strategy: resolved.resolution,
+                trace_copy_path: resolved.trace_copy_path,
+                generated: raw.generated,
+            });
+        }
+
+        dumps.push(TransformedFormsDump {
+            module: parsed.module,
+            format: "erl_pp:form/1 pretty-printed Erlang source".to_string(),
+            build_path: dump_path.display().to_string(),
+            trace_copy_path: format!(
+                "recorder_metadata/transformed_forms/{}",
+                dump_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("transformed.erl")
+            ),
+            runtime_path: dump_path.display().to_string(),
+        });
+    }
+
+    locations.sort_by(|left, right| {
+        (
+            &left.module,
+            &left.source_path,
+            left.resolved_line,
+            left.resolved_column,
+            left.location_id,
+        )
+            .cmp(&(
+                &right.module,
+                &right.source_path,
+                right.resolved_line,
+                right.resolved_column,
+                right.location_id,
+            ))
+    });
+    locations.dedup_by_key(|location| location.location_id);
+
+    Ok(InstrumentationArtifacts {
+        ebin_dir: Some(ebin_dir),
+        locations,
+        dumps,
+    })
+}
+
+fn run_forms_instrumenter(
+    runtime_ebin: &Path,
+    source_path: &Path,
+    ebin_dir: &Path,
+    locations_path: &Path,
+    dump_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let expression = format!(
+        "case codetracer_forms:instrument_file({source}, {out_dir}, {locations}, {dump}) of ok -> halt(0); {{error, Reason}} -> io:format(standard_error, \"~tp~n\", [Reason]), halt(1) end.",
+        source = erlang_string(&source_path.display().to_string()),
+        out_dir = erlang_string(&ebin_dir.display().to_string()),
+        locations = erlang_string(&locations_path.display().to_string()),
+        dump = erlang_string(&dump_path.display().to_string())
+    );
+    let output = Command::new("erl")
+        .args(["-noshell", "-pa"])
+        .arg(runtime_ebin)
+        .arg("-eval")
+        .arg(expression)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "abstract-forms instrumentation failed for {} with status {:?}\n{}{}",
+            source_path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
 fn write_recorder_metadata(
     out_dir: &Path,
     source_root: &Path,
     trace_functions: &[TraceFunctionSpec],
+    step_locations: &[TraceLocationSpec],
     source_maps: &[SparseSourceMap],
+    transformed_form_dumps: &[TransformedFormsDump],
 ) -> Result<(Vec<ManifestArtifact>, Vec<SourceMapArtifact>), Box<dyn Error>> {
     let metadata_root = out_dir.join("recorder_metadata");
     let manifests_root = metadata_root.join("manifests");
@@ -1519,8 +1795,14 @@ fn write_recorder_metadata(
         source_root,
         &manifests_root,
         trace_functions,
+        step_locations,
         &source_map_artifacts,
     )?;
+    for dump in transformed_form_dumps {
+        if !Path::new(&dump.runtime_path).is_file() {
+            return Err(format!("missing transformed-forms dump {}", dump.runtime_path).into());
+        }
+    }
 
     Ok((manifest_artifacts, source_map_artifacts))
 }
@@ -1558,6 +1840,7 @@ fn write_module_manifests(
     source_root: &Path,
     manifests_root: &Path,
     trace_functions: &[TraceFunctionSpec],
+    step_locations: &[TraceLocationSpec],
     source_maps: &[SourceMapArtifact],
 ) -> Result<Vec<ManifestArtifact>, Box<dyn Error>> {
     let mut by_module: BTreeMap<String, Vec<TraceFunctionSpec>> = BTreeMap::new();
@@ -1581,6 +1864,45 @@ fn write_module_manifests(
         let trace_copy = trace_copy_path(source_root, &first.source_path);
         let manifest_id = manifest_id_for_module(&module);
         let source_language = first.kind.clone();
+        let module_step_locations = step_locations
+            .iter()
+            .filter(|location| location.module == module)
+            .collect::<Vec<_>>();
+        let mut manifest_locations = BTreeMap::new();
+        for function in &functions {
+            manifest_locations.insert(
+                function.location_id,
+                ManifestLocation {
+                    id: function.location_id,
+                    build_path: function.resolved_source_path.display().to_string(),
+                    project_relative_path: project_relative_path(
+                        source_root,
+                        &function.resolved_source_path,
+                    ),
+                    trace_copy_path: function.trace_copy_path.clone(),
+                    line: function.resolved_line,
+                    column: function.resolved_column,
+                    resolution: function.resolution_strategy.clone(),
+                },
+            );
+        }
+        for location in &module_step_locations {
+            manifest_locations.insert(
+                location.location_id,
+                ManifestLocation {
+                    id: location.location_id,
+                    build_path: location.resolved_source_path.display().to_string(),
+                    project_relative_path: project_relative_path(
+                        source_root,
+                        &location.resolved_source_path,
+                    ),
+                    trace_copy_path: location.trace_copy_path.clone(),
+                    line: location.resolved_line,
+                    column: location.resolved_column,
+                    resolution: location.resolution_strategy.clone(),
+                },
+            );
+        }
         let manifest = ModuleManifest {
             schema: "codetracer.beam.module-manifest.v1".to_string(),
             encoding: "json".to_string(),
@@ -1604,21 +1926,7 @@ fn write_module_manifests(
                     traceable: true,
                 })
                 .collect(),
-            locations: functions
-                .iter()
-                .map(|function| ManifestLocation {
-                    id: function.location_id,
-                    build_path: function.resolved_source_path.display().to_string(),
-                    project_relative_path: project_relative_path(
-                        source_root,
-                        &function.resolved_source_path,
-                    ),
-                    trace_copy_path: function.trace_copy_path.clone(),
-                    line: function.resolved_line,
-                    column: function.resolved_column,
-                    resolution: function.resolution_strategy.clone(),
-                })
-                .collect(),
+            locations: manifest_locations.into_values().collect(),
             clauses: functions
                 .iter()
                 .map(|function| ManifestClause {
@@ -1652,6 +1960,9 @@ fn write_module_manifests(
                     functions.iter().any(|function| {
                         source_map.generated_build_path
                             == function.source_path.display().to_string()
+                    }) || module_step_locations.iter().any(|location| {
+                        source_map.generated_build_path
+                            == location.source_path.display().to_string()
                     })
                 })
                 .map(|source_map| source_map.trace_copy_path.clone())
@@ -2365,6 +2676,7 @@ struct CompatibilityTraceMeta<'a> {
     sources: &'a [CopiedSource],
     manifests: &'a [ManifestArtifact],
     source_maps: &'a [SourceMapArtifact],
+    transformed_form_dumps: &'a [TransformedFormsDump],
     metadata_contract: CompatibilityMetadataContract,
 }
 
@@ -2439,6 +2751,7 @@ fn write_trace_meta_json(
         sources: &session.runtime.copied_sources,
         manifests: &session.runtime.manifests,
         source_maps: &session.runtime.source_maps,
+        transformed_form_dumps: &session.runtime.transformed_form_dumps,
         metadata_contract: CompatibilityMetadataContract {
             manifest_schema: "codetracer.beam.module-manifest.v1",
             manifest_encoding: "json",
