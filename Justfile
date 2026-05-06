@@ -1,0 +1,69 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+build:
+  if ! command -v cargo >/dev/null 2>&1; then nix develop --command just build; else just build-native; fi
+
+build-native:
+  cargo build --locked
+
+test:
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-elixir && just test-erlang && just test-integration; fi
+
+t: test
+
+test-rust:
+  cargo test --locked
+
+test-elixir:
+  elixir -e 'case Version.parse(System.version()) do {:ok, _version} -> :ok; _ -> System.halt(1) end'
+
+test-erlang:
+  erl -noshell -eval 'case erlang:system_info(otp_release) of [_|_] -> halt(0); _ -> halt(1) end.'
+
+test-integration:
+  cargo run --locked -- --help >/dev/null
+  cargo run --locked -- --version | grep -F "$(grep -E '^version = "' Cargo.toml | head -n1 | cut -d '"' -f2)"
+  set +e; cargo run --locked -- record --out-dir /tmp --format json -- sh -c 'exit 7'; status="$?"; set -e; test "$status" -eq 7
+
+lint:
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shellcheck >/dev/null 2>&1; then nix develop --command just lint; else just lint-nix && just lint-rust && just lint-shell && just verify-repo-requirements; fi
+
+lint-nix:
+  nixfmt --check flake.nix
+
+lint-rust:
+  cargo fmt --check
+  cargo clippy --locked --all-targets -- -D warnings
+
+lint-shell:
+  shellcheck tests/verify-repo-requirements.sh
+
+verify-repo-requirements:
+  bash tests/verify-repo-requirements.sh
+
+format:
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shfmt >/dev/null 2>&1; then nix develop --command just format; else just format-nix && just format-rust && just format-shell; fi
+
+fmt: format
+
+format-nix:
+  nixfmt flake.nix
+
+format-rust:
+  cargo fmt
+
+format-shell:
+  shfmt -w tests/verify-repo-requirements.sh
+
+test-integration-fixture:
+  just test-integration
+
+bench:
+  cargo build --release --locked
+  target/release/codetracer-elixir-recorder --version >/dev/null
+
+bump-version new_version:
+  case "{{new_version}}" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "version must be semver MAJOR.MINOR.PATCH" >&2; exit 1 ;; esac
+  sed -i.bak -E 's/^version = "[^"]+"/version = "{{new_version}}"/' Cargo.toml
+  rm -f Cargo.toml.bak
+  cargo update --workspace

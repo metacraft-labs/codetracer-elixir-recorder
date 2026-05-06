@@ -1,0 +1,9 @@
+[package]
+name = "codetracer-elixir-recorder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/metacraft-labs/codetracer-elixir-recorder"
+description = "CodeTracer Elixir and Erlang materialized trace recorder"
+
+[dependencies]
