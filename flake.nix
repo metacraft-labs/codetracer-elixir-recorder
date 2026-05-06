@@ -92,6 +92,7 @@
                 elixir
                 erlang
                 just
+                jq
                 nixfmt
                 rustc
                 rustfmt

@@ -7,7 +7,7 @@ build-native:
   cargo build --locked
 
 test:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-elixir && just test-erlang && just test-integration; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just test-integration; fi
 
 t: test
 
@@ -15,10 +15,13 @@ test-rust:
   cargo test --locked
 
 test-elixir:
-  elixir -e 'case Version.parse(System.version()) do {:ok, _version} -> :ok; _ -> System.halt(1) end'
+  bash tests/fixtures/run-elixir-canonical-flow.sh
 
 test-erlang:
-  erl -noshell -eval 'case erlang:system_info(otp_release) of [_|_] -> halt(0); _ -> halt(1) end.'
+  bash tests/fixtures/run-erlang-canonical-flow.sh
+
+test-goldens:
+  bash tests/verify-golden-contract.sh
 
 test-integration:
   cargo run --locked -- --help >/dev/null
@@ -36,7 +39,7 @@ lint-rust:
   cargo clippy --locked --all-targets -- -D warnings
 
 lint-shell:
-  shellcheck tests/verify-repo-requirements.sh
+  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/fixtures/*.sh
 
 verify-repo-requirements:
   bash tests/verify-repo-requirements.sh
@@ -53,7 +56,7 @@ format-rust:
   cargo fmt
 
 format-shell:
-  shfmt -w tests/verify-repo-requirements.sh
+  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/fixtures/*.sh
 
 test-integration-fixture:
   just test-integration

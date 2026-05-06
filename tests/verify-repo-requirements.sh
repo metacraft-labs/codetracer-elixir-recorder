@@ -82,6 +82,9 @@ require_file Cargo.lock
 require_file .github/workflows/ci.yml
 require_file .github/sibling-pins.json
 require_executable tests/verify-repo-requirements.sh
+require_executable tests/verify-golden-contract.sh
+require_executable tests/fixtures/run-elixir-canonical-flow.sh
+require_executable tests/fixtures/run-erlang-canonical-flow.sh
 
 require_text .envrc '^use flake$' ".envrc uses flake"
 
@@ -101,7 +104,7 @@ require_text flake.nix 'check-added-large-files\.enable = true;' "pre-commit inc
 require_text flake.nix 'check-merge-conflicts\.enable = true;' "pre-commit includes merge-conflict check"
 require_text flake.nix 'entry = "just lint";' "pre-commit includes just lint hook"
 
-for recipe in build test lint format fmt t build-native test-elixir test-erlang test-rust test-integration bench bump-version; do
+for recipe in build test lint format fmt t build-native test-elixir test-erlang test-rust test-goldens test-integration bench bump-version; do
   require_just_recipe "$recipe"
 done
 

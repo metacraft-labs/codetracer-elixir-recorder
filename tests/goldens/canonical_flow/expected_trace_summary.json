@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "fixture": "canonical_flow",
+  "hand_authored": true,
+  "recorder_output_used": false,
+  "derivation_comments": [
+    "Values are derived by evaluating literal integer assignments in source order.",
+    "Function sequence includes fixture-owned source functions only.",
+    "Process relationships are derived from the absence of spawn, Task, OTP behavior startup, and message-send expressions in fixture source."
+  ],
+  "expected_stdout": "94\n",
+  "expected_exit_code": 0,
+  "value_type_expectations": {
+    "type_kind": "Int",
+    "lang_type": "integer"
+  },
+  "languages": {
+    "elixir": {
+      "source_path": "test-programs/elixir/canonical_flow/lib/canonical_flow.ex",
+      "entry_function": "CanonicalFlow.main/0",
+      "source_location_evidence": [
+        {"line": 4, "text": "def compute do"},
+        {"line": 5, "text": "a = 10"},
+        {"line": 6, "text": "b = 32"},
+        {"line": 7, "text": "sum_val = a + b"},
+        {"line": 8, "text": "doubled = sum_val * 2"},
+        {"line": 9, "text": "final_result = doubled + a"},
+        {"line": 10, "text": "true = final_result == 94"},
+        {"line": 11, "text": "final_result"},
+        {"line": 14, "text": "def main do"},
+        {"line": 15, "text": "result = compute()"},
+        {"line": 16, "text": "true = result == 94"},
+        {"line": 17, "text": "IO.puts(result)"},
+        {"line": 18, "text": "result"}
+      ],
+      "function_sequence": [
+        {"event": "call", "function": "CanonicalFlow.main/0", "line": 14},
+        {"event": "call", "function": "CanonicalFlow.compute/0", "line": 4, "call_site_line": 15},
+        {"event": "return", "function": "CanonicalFlow.compute/0", "line": 11, "value": 94},
+        {"event": "stdout", "function": "CanonicalFlow.main/0", "line": 17, "content": "94\n"},
+        {"event": "return", "function": "CanonicalFlow.main/0", "line": 18, "value": 94}
+      ],
+      "variables": [
+        {"name": "a", "line": 5, "value": 10},
+        {"name": "b", "line": 6, "value": 32},
+        {"name": "sum_val", "line": 7, "value": 42},
+        {"name": "doubled", "line": 8, "value": 84},
+        {"name": "final_result", "line": 9, "value": 94},
+        {"name": "result", "line": 15, "value": 94}
+      ],
+      "process_relationships": {
+        "fixture_owned_process_count": 1,
+        "spawned_child_processes": [],
+        "messages_sent_by_fixture_source": []
+      }
+    },
+    "erlang": {
+      "source_path": "test-programs/erlang/canonical_flow/src/canonical_flow.erl",
+      "entry_function": "canonical_flow:main/0",
+      "source_location_evidence": [
+        {"line": 4, "text": "compute() ->"},
+        {"line": 5, "text": "A = 10,"},
+        {"line": 6, "text": "B = 32,"},
+        {"line": 7, "text": "SumVal = A + B,"},
+        {"line": 8, "text": "Doubled = SumVal * 2,"},
+        {"line": 9, "text": "FinalResult = Doubled + A,"},
+        {"line": 10, "text": "true = FinalResult =:= 94,"},
+        {"line": 11, "text": "FinalResult."},
+        {"line": 13, "text": "main() ->"},
+        {"line": 14, "text": "Result = compute(),"},
+        {"line": 15, "text": "true = Result =:= 94,"},
+        {"line": 16, "text": "io:format(\"~p~n\", [Result]),"},
+        {"line": 17, "text": "Result."}
+      ],
+      "function_sequence": [
+        {"event": "call", "function": "canonical_flow:main/0", "line": 13},
+        {"event": "call", "function": "canonical_flow:compute/0", "line": 4, "call_site_line": 14},
+        {"event": "return", "function": "canonical_flow:compute/0", "line": 11, "value": 94},
+        {"event": "stdout", "function": "canonical_flow:main/0", "line": 16, "content": "94\n"},
+        {"event": "return", "function": "canonical_flow:main/0", "line": 17, "value": 94}
+      ],
+      "variables": [
+        {"name": "A", "canonical_name": "a", "line": 5, "value": 10},
+        {"name": "B", "canonical_name": "b", "line": 6, "value": 32},
+        {"name": "SumVal", "canonical_name": "sum_val", "line": 7, "value": 42},
+        {"name": "Doubled", "canonical_name": "doubled", "line": 8, "value": 84},
+        {"name": "FinalResult", "canonical_name": "final_result", "line": 9, "value": 94},
+        {"name": "Result", "canonical_name": "result", "line": 14, "value": 94}
+      ],
+      "process_relationships": {
+        "fixture_owned_process_count": 1,
+        "spawned_child_processes": [],
+        "messages_sent_by_fixture_source": []
+      }
+    }
+  }
+}

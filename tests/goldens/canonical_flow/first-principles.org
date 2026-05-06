@@ -1,0 +1,127 @@
+#+TITLE: Canonical Flow First-Principles Golden Contract
+
+* Scope
+  This golden contract is hand-derived from the canonical Elixir and Erlang
+  fixture source files. It is not derived from recorder output.
+
+  DERIVATION: The only arithmetic in the source programs is literal integer
+  arithmetic in =compute/0=. The values below follow directly from evaluating
+  each assignment in source order.
+
+* Expected Program Result
+  - expected stdout: =94\n=
+  - expected exit code: =0=
+
+  DERIVATION: Both fixture entrypoints assert the canonical value before
+  printing. If either assertion fails, the BEAM process exits non-zero before
+  the expected stdout can be accepted by the fixture execution tests.
+
+* Source-Location Evidence
+** Elixir source
+   Source path:
+   =test-programs/elixir/canonical_flow/lib/canonical_flow.ex=
+
+   #+begin_example
+   canonical_flow.ex:4  def compute do
+   canonical_flow.ex:5    a = 10
+   canonical_flow.ex:6    b = 32
+   canonical_flow.ex:7    sum_val = a + b
+   canonical_flow.ex:8    doubled = sum_val * 2
+   canonical_flow.ex:9    final_result = doubled + a
+   canonical_flow.ex:10   true = final_result == 94
+   canonical_flow.ex:11   final_result
+   canonical_flow.ex:14 def main do
+   canonical_flow.ex:15   result = compute()
+   canonical_flow.ex:16   true = result == 94
+   canonical_flow.ex:17   IO.puts(result)
+   canonical_flow.ex:18   result
+   #+end_example
+
+** Erlang source
+   Source path:
+   =test-programs/erlang/canonical_flow/src/canonical_flow.erl=
+
+   #+begin_example
+   canonical_flow.erl:4  compute() ->
+   canonical_flow.erl:5      A = 10,
+   canonical_flow.erl:6      B = 32,
+   canonical_flow.erl:7      SumVal = A + B,
+   canonical_flow.erl:8      Doubled = SumVal * 2,
+   canonical_flow.erl:9      FinalResult = Doubled + A,
+   canonical_flow.erl:10     true = FinalResult =:= 94,
+   canonical_flow.erl:11     FinalResult.
+   canonical_flow.erl:13 main() ->
+   canonical_flow.erl:14     Result = compute(),
+   canonical_flow.erl:15     true = Result =:= 94,
+   canonical_flow.erl:16     io:format("~p~n", [Result]),
+   canonical_flow.erl:17     Result.
+   #+end_example
+
+* Function Sequence
+** Elixir
+   1. =CanonicalFlow.main/0= is entered at =canonical_flow.ex:14=.
+   2. =CanonicalFlow.main/0= calls =CanonicalFlow.compute/0= from
+      =canonical_flow.ex:15=.
+   3. =CanonicalFlow.compute/0= is entered at =canonical_flow.ex:4=.
+   4. =CanonicalFlow.compute/0= returns =94= after =canonical_flow.ex:11=.
+   5. =CanonicalFlow.main/0= prints =94\n= at =canonical_flow.ex:17=.
+   6. =CanonicalFlow.main/0= returns =94= after =canonical_flow.ex:18=.
+
+** Erlang
+   1. =canonical_flow:main/0= is entered at =canonical_flow.erl:13=.
+   2. =canonical_flow:main/0= calls =canonical_flow:compute/0= from
+      =canonical_flow.erl:14=.
+   3. =canonical_flow:compute/0= is entered at =canonical_flow.erl:4=.
+   4. =canonical_flow:compute/0= returns =94= after =canonical_flow.erl:11=.
+   5. =canonical_flow:main/0= prints =94\n= at =canonical_flow.erl:16=.
+   6. =canonical_flow:main/0= returns =94= after =canonical_flow.erl:17=.
+
+   DERIVATION: The expected function sequence contains only source functions
+   owned by the fixture. Mix, erl, code loading, and assertion machinery are
+   real toolchain behavior but are outside this source-level fixture oracle.
+
+* Variable Values
+** Elixir
+   | variable     | source location       | value | derivation                  |
+   |--------------+-----------------------+-------+-----------------------------|
+   | =a=          | =canonical_flow.ex:5=  |    10 | literal                     |
+   | =b=          | =canonical_flow.ex:6=  |    32 | literal                     |
+   | =sum_val=    | =canonical_flow.ex:7=  |    42 | =10 + 32=                  |
+   | =doubled=    | =canonical_flow.ex:8=  |    84 | =42 * 2=                   |
+   | =final_result= | =canonical_flow.ex:9= |    94 | =84 + 10=                  |
+   | =result=     | =canonical_flow.ex:15= |    94 | return from =compute/0=     |
+
+** Erlang
+   Erlang variables are capitalized in source. The canonical recorder variable
+   names should preserve source spelling while the contract also records the
+   cross-language canonical name.
+
+   | source variable | canonical name | source location        | value | derivation                 |
+   |-----------------+----------------+------------------------+-------+----------------------------|
+   | =A=             | =a=            | =canonical_flow.erl:5=  |    10 | literal                    |
+   | =B=             | =b=            | =canonical_flow.erl:6=  |    32 | literal                    |
+   | =SumVal=        | =sum_val=      | =canonical_flow.erl:7=  |    42 | =10 + 32=                 |
+   | =Doubled=       | =doubled=      | =canonical_flow.erl:8=  |    84 | =42 * 2=                  |
+   | =FinalResult=   | =final_result= | =canonical_flow.erl:9=  |    94 | =84 + 10=                 |
+   | =Result=        | =result=       | =canonical_flow.erl:14= |    94 | return from =compute/0=    |
+
+* Expected Value Types
+  All observed fixture values are BEAM integers and fit in the trace format
+  =Int= value representation. The expected language type display name is
+  =integer= for both Elixir and Erlang.
+
+  DERIVATION: Every value is produced by integer literals or integer
+  arithmetic over those literals; no float, binary, list, tuple, atom, pid,
+  map, or struct value is introduced by the source fixture.
+
+* Process Relationships
+  - The fixture source creates no child BEAM process with =spawn=, =Task=, or
+    OTP behavior startup.
+  - The fixture source sends no application message between BEAM processes.
+  - The expected source-level process model is one main execution process
+    represented as one CodeTracer thread for fixture-owned source events.
+
+  DERIVATION: The Elixir and Erlang source files contain no process creation
+  or message-send expression. Mix, erl, logger, code server, and other runtime
+  infrastructure may exist while the real toolchains run, but those are not
+  fixture-owned process relationships.
