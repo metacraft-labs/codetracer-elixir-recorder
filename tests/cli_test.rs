@@ -169,6 +169,26 @@ fn compile_erlang_generated_source_map_fixture(ebin_dir: &Path) {
     assert_success(&compile, &format!("erlc {}", source.display()));
 }
 
+fn compile_erlang_sources(source_dir: &Path, ebin_dir: &Path) {
+    fs::create_dir_all(ebin_dir).expect("create Erlang ebin dir");
+    let mut sources = fs::read_dir(source_dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", source_dir.display()))
+        .map(|entry| entry.expect("source entry").path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("erl"))
+        .collect::<Vec<_>>();
+    sources.sort();
+    for source in sources {
+        let compile = Command::new("erlc")
+            .arg("+debug_info")
+            .arg("-o")
+            .arg(ebin_dir)
+            .arg(&source)
+            .output()
+            .expect("run erlc for standalone fixture");
+        assert_success(&compile, &format!("erlc {}", source.display()));
+    }
+}
+
 fn record_elixir_expression(label: &str, expression: &str) -> RecordedTrace {
     let tmp = temp_dir(label);
     let out_dir = tmp.join("trace");
@@ -2630,6 +2650,462 @@ fn e2e_cli_honors_env_vars_and_compile_instrument_aliases() {
 }
 
 #[test]
+fn e2e_cli_compile_records_real_erlang_project() {
+    let tmp = temp_dir("m11-compile-record");
+    let fixture_dir = repo_root().join("test-programs/erlang/multi_module");
+    let build_dir = tmp.join("standalone-build");
+    let out_dir = tmp.join("trace");
+
+    let compile = clean_recorder_command()
+        .args([
+            "compile",
+            "--build-dir",
+            build_dir.to_str().unwrap(),
+            "--source-dir",
+            fixture_dir.to_str().unwrap(),
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("compile standalone Erlang fixture");
+    assert_eq!(compile.status.code(), Some(0), "{}", output_text(&compile));
+    assert!(build_dir.join("standalone_build.json").is_file());
+    assert!(build_dir
+        .join("instrumented/ebin/standalone_main.beam")
+        .is_file());
+    assert!(build_dir
+        .join("instrumented/ebin/standalone_helper.beam")
+        .is_file());
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--build-dir",
+            build_dir.to_str().unwrap(),
+            "--root-mfa",
+            "standalone_main:main/0",
+            "--",
+            "erl",
+            "-noshell",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("record standalone Erlang fixture");
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "m11-multi:42\n");
+
+    let reader = open_named_trace(&out_dir, "erl.ct");
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name.contains("standalone_main:main/0"))
+            && call_names
+                .iter()
+                .any(|name| name.contains("standalone_helper:bonus/1")),
+        "reader should expose calls from both real modules: {call_names:#?}"
+    );
+    let mut raw_reader = CtfsReader::open(&out_dir.join("erl.ct")).expect("open raw CTFS trace");
+    let raw_steps = raw_reader
+        .read_file("steps.dat")
+        .expect("read raw steps.dat");
+    assert!(
+        !raw_steps.is_empty(),
+        "raw CTFS should contain instrumented steps"
+    );
+
+    let generated_fixture = repo_root().join("test-programs/erlang/generated_source_map");
+    let generated_build_dir = tmp.join("generated-build");
+    let generated_compile = clean_recorder_command()
+        .args([
+            "compile",
+            "--build-dir",
+            generated_build_dir.to_str().unwrap(),
+            "--source-dir",
+            generated_fixture.to_str().unwrap(),
+            "--source-map",
+            generated_fixture
+                .join("source_maps/generated_bridge.json")
+                .to_str()
+                .unwrap(),
+        ])
+        .current_dir(&generated_fixture)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("compile generated Erlang source-map fixture");
+    assert_eq!(
+        generated_compile.status.code(),
+        Some(0),
+        "{}",
+        output_text(&generated_compile)
+    );
+    assert!(
+        generated_build_dir
+            .join("recorder_metadata/source_maps/001-src_generated_bridge.erl.json")
+            .is_file(),
+        "explicit source map should be copied into standalone build metadata"
+    );
+    let generated_manifests = manifest_jsons(&generated_build_dir);
+    assert!(
+        generated_manifests.iter().any(|manifest| {
+            manifest["locations"].as_array().is_some_and(|locations| {
+                locations
+                    .iter()
+                    .any(|location| location["resolution"] == "source_map")
+            })
+        }),
+        "generated Erlang compile should preserve source-map-resolved manifest locations"
+    );
+
+    let auto_tmp = tmp.join("auto-record");
+    fs::create_dir_all(&auto_tmp).expect("create auto-record cwd");
+    let auto_out_dir = auto_tmp.join("trace");
+    let auto_output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            auto_out_dir.to_str().unwrap(),
+            "--source-dir",
+            fixture_dir.to_str().unwrap(),
+            "--root-mfa",
+            "standalone_main:main/0",
+            "--",
+            "erl",
+            "-noshell",
+        ])
+        .current_dir(&auto_tmp)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("record standalone Erlang fixture with default build dir");
+    assert_eq!(
+        auto_output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&auto_output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&auto_output.stdout),
+        "m11-multi:42\n"
+    );
+    assert!(auto_tmp
+        .join("_codetracer/elixir-recorder/standalone/standalone_build.json")
+        .is_file());
+    let auto_reader = open_named_trace(&auto_out_dir, "erl.ct");
+    let auto_call_names = reader_call_function_names(&auto_reader);
+    assert!(
+        auto_call_names
+            .iter()
+            .any(|name| name.contains("standalone_helper:bonus/1")),
+        "record --source-dir should compile and prepend the default instrumented build: {auto_call_names:#?}"
+    );
+}
+
+#[test]
+fn e2e_cli_instrument_build_dir_isolated() {
+    let tmp = temp_dir("m11-instrument-isolated");
+    let fixture_dir = repo_root().join("test-programs/erlang/multi_module");
+    let source_dir = fixture_dir.join("src");
+    let normal_ebin = tmp.join("normal-ebin");
+    let build_dir = tmp.join("instrumented-build");
+    compile_erlang_sources(&source_dir, &normal_ebin);
+    let before = fs::read(normal_ebin.join("standalone_main.beam")).expect("read original beam");
+
+    let output = clean_recorder_command()
+        .args([
+            "instrument",
+            "--build-dir",
+            build_dir.to_str().unwrap(),
+            "--source-dir",
+            fixture_dir.to_str().unwrap(),
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("instrument standalone Erlang fixture");
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    let after = fs::read(normal_ebin.join("standalone_main.beam")).expect("read original beam");
+    assert_eq!(before, after, "normal build artifact changed");
+    assert!(build_dir
+        .join("instrumented/ebin/standalone_main.beam")
+        .is_file());
+    assert!(build_dir
+        .join("recorder_metadata/manifests/standalone_main.manifest.json")
+        .is_file());
+    assert!(!fixture_dir.join("recorder_metadata").exists());
+    assert!(
+        !build_dir.join("erl.ct").exists(),
+        "instrument must not run the target"
+    );
+}
+
+#[test]
+fn e2e_cli_module_filters_real_project() {
+    let tmp = temp_dir("m11-module-filters");
+    let fixture_dir = repo_root().join("test-programs/erlang/module_filters");
+    let source_dir = fixture_dir.join("src");
+    let original_ebin = tmp.join("original-ebin");
+    let build_dir = tmp.join("filtered-build");
+    let out_dir = tmp.join("trace");
+    compile_erlang_sources(&source_dir, &original_ebin);
+
+    let instrument = clean_recorder_command()
+        .args([
+            "instrument",
+            "--build-dir",
+            build_dir.to_str().unwrap(),
+            "--source-dir",
+            fixture_dir.to_str().unwrap(),
+            "--include-module",
+            "filter_entry",
+            "--include-module",
+            "filter_keep",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("instrument filtered Erlang fixture");
+    assert_eq!(
+        instrument.status.code(),
+        Some(0),
+        "{}",
+        output_text(&instrument)
+    );
+    assert!(build_dir
+        .join("instrumented/ebin/filter_entry.beam")
+        .is_file());
+    assert!(build_dir
+        .join("instrumented/ebin/filter_keep.beam")
+        .is_file());
+    assert!(!build_dir
+        .join("instrumented/ebin/filter_skip.beam")
+        .exists());
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--build-dir",
+            build_dir.to_str().unwrap(),
+            "--root-mfa",
+            "filter_entry:main/0",
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            original_ebin.to_str().unwrap(),
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("record filtered Erlang fixture");
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "m11-filter:28\n");
+
+    let reader = open_named_trace(&out_dir, "erl.ct");
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name.contains("filter_entry:main/0")),
+        "missing included entry call: {call_names:#?}"
+    );
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name.contains("filter_keep:run/1")),
+        "missing included helper call: {call_names:#?}"
+    );
+    assert!(
+        !call_names
+            .iter()
+            .any(|name| name.contains("filter_skip:run/1")),
+        "excluded module should not produce traced calls: {call_names:#?}"
+    );
+    let location_index = manifest_location_index(&build_dir);
+    let step_locations = runtime_sidecar_events(&out_dir)
+        .into_iter()
+        .filter(|event| event["event"] == "step")
+        .map(|event| {
+            let id = event["location_id"].as_u64().expect("step location_id");
+            location_index
+                .get(&id)
+                .unwrap_or_else(|| panic!("step location_id {id} missing from build manifests"))
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !step_locations.is_empty(),
+        "record should execute instrumented BEAMs before normal ebin paths"
+    );
+    assert!(
+        step_locations
+            .iter()
+            .any(|(trace_copy_path, _, _)| trace_copy_path.contains("filter_entry.erl"))
+            && step_locations
+                .iter()
+                .any(|(trace_copy_path, _, _)| trace_copy_path.contains("filter_keep.erl")),
+        "included modules should emit instrumented steps: {step_locations:#?}"
+    );
+    assert!(
+        !step_locations
+            .iter()
+            .any(|(trace_copy_path, _, _)| trace_copy_path.contains("filter_skip.erl")),
+        "excluded module should not emit instrumented steps: {step_locations:#?}"
+    );
+
+    assert_recorder_error(
+        clean_recorder_command()
+            .args([
+                "compile",
+                "--build-dir",
+                tmp.join("mismatch-build").to_str().unwrap(),
+                "--source-dir",
+                fixture_dir.to_str().unwrap(),
+                "--include-module",
+                "does_not_exist",
+            ])
+            .current_dir(&fixture_dir)
+            .env("TMPDIR", tmp.to_str().unwrap())
+            .output()
+            .expect("run module filter mismatch scenario"),
+        "module_filter_mismatch",
+    );
+}
+
+#[test]
+fn e2e_cli_capture_messages_switch_and_value_limits() {
+    let tmp = temp_dir("m11-switches");
+
+    let spawn_fixture = repo_root().join("test-programs/erlang/spawn_messages");
+    let spawn_build_dir = tmp.join("spawn-build");
+    let spawn_out_dir = tmp.join("spawn-trace");
+    let compile_spawn = clean_recorder_command()
+        .args([
+            "compile",
+            "--build-dir",
+            spawn_build_dir.to_str().unwrap(),
+            "--source-dir",
+            spawn_fixture.to_str().unwrap(),
+        ])
+        .current_dir(&spawn_fixture)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("compile spawn fixture for message switch");
+    assert_eq!(
+        compile_spawn.status.code(),
+        Some(0),
+        "{}",
+        output_text(&compile_spawn)
+    );
+
+    let no_messages = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            spawn_out_dir.to_str().unwrap(),
+            "--build-dir",
+            spawn_build_dir.to_str().unwrap(),
+            "--root-mfa",
+            "spawn_messages:main/0",
+            "--capture-messages",
+            "false",
+            "--",
+            "erl",
+            "-noshell",
+        ])
+        .current_dir(&spawn_fixture)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("record spawn fixture with message capture disabled");
+    assert_eq!(
+        no_messages.status.code(),
+        Some(0),
+        "{}",
+        output_text(&no_messages)
+    );
+    assert_eq!(String::from_utf8_lossy(&no_messages.stdout), "spawn-ok\n");
+    let events = runtime_sidecar_events(&spawn_out_dir);
+    assert!(
+        sidecar_message_events(&events).is_empty(),
+        "--capture-messages false should suppress send/receive sidecar events: {events:#?}"
+    );
+    assert_reader_thread_event(&spawn_out_dir, "erl.ct", "thread_start", 1);
+
+    let value_fixture = repo_root().join("test-programs/erlang/value_matrix");
+    let value_build_dir = tmp.join("value-build");
+    let value_out_dir = tmp.join("value-trace");
+    let compile_values = clean_recorder_command()
+        .args([
+            "compile",
+            "--build-dir",
+            value_build_dir.to_str().unwrap(),
+            "--source-dir",
+            value_fixture.to_str().unwrap(),
+        ])
+        .current_dir(&value_fixture)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("compile value matrix fixture for CLI value limits");
+    assert_eq!(
+        compile_values.status.code(),
+        Some(0),
+        "{}",
+        output_text(&compile_values)
+    );
+
+    let limited = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            value_out_dir.to_str().unwrap(),
+            "--build-dir",
+            value_build_dir.to_str().unwrap(),
+            "--root-mfa",
+            "value_matrix:truncation/0",
+            "--value-max-depth",
+            "2",
+            "--value-max-sequence-items",
+            "3",
+            "--value-max-binary-bytes",
+            "4",
+            "--value-max-map-pairs",
+            "2",
+            "--value-max-string-bytes",
+            "5",
+            "--",
+            "erl",
+            "-noshell",
+        ])
+        .current_dir(&value_fixture)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("record value matrix fixture with CLI value limits");
+    assert_eq!(limited.status.code(), Some(0), "{}", output_text(&limited));
+    assert_eq!(String::from_utf8_lossy(&limited.stdout), "truncation-ok\n");
+
+    let values = raw_ctfs_low_level_values(&value_out_dir, "erl.ct");
+    let long_list = find_named_value(&values, "LongList");
+    assert!(matches!(
+        long_list,
+        ValueRecord::Sequence { elements, .. }
+            if elements.len() == 4
+                && matches!(elements.last(), Some(ValueRecord::Raw { r, .. }) if r == "[truncated]")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LongString"),
+        ValueRecord::String { text, .. } if text == "aaaaa..."
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LongRawBinary"),
+        ValueRecord::Raw { r, .. } if r == "0x00FF1041..."
+    ));
+}
+
+#[test]
 fn e2e_cli_structured_errors() {
     let tmp = temp_dir("errors");
 
@@ -2711,6 +3187,65 @@ fn e2e_cli_structured_errors() {
         .expect("restore output dir permissions");
 
     assert_recorder_error(writer_failure, "writer_initialization_failed");
+
+    let bad_source_dir = tmp.join("bad-source/src");
+    fs::create_dir_all(&bad_source_dir).expect("create bad Erlang source dir");
+    fs::write(
+        bad_source_dir.join("bad_compile.erl"),
+        b"-module(bad_compile).\n-export([main/0]).\nmain() ->\n",
+    )
+    .expect("write malformed Erlang source");
+    assert_recorder_error(
+        clean_recorder_command()
+            .args([
+                "compile",
+                "--build-dir",
+                tmp.join("bad-compile-build").to_str().unwrap(),
+                "--source-dir",
+                bad_source_dir.parent().unwrap().to_str().unwrap(),
+            ])
+            .current_dir(bad_source_dir.parent().unwrap())
+            .env("TMPDIR", tmp.to_str().unwrap())
+            .output()
+            .expect("run compile failure scenario"),
+        "compile_failure",
+    );
+
+    let bad_map_fixture = repo_root().join("test-programs/erlang/generated_source_map");
+    let bad_map = tmp.join("bad-source-map.json");
+    fs::write(&bad_map, b"{\"schema\":\"wrong\"}").expect("write invalid source map");
+    assert_recorder_error(
+        clean_recorder_command()
+            .args([
+                "compile",
+                "--build-dir",
+                tmp.join("bad-map-build").to_str().unwrap(),
+                "--source-dir",
+                bad_map_fixture.to_str().unwrap(),
+                "--source-map",
+                bad_map.to_str().unwrap(),
+            ])
+            .current_dir(&bad_map_fixture)
+            .env("TMPDIR", tmp.to_str().unwrap())
+            .output()
+            .expect("run source-map failure scenario"),
+        "source_map_failure",
+    );
+
+    let trace_write_out_dir = tmp.join("trace-write");
+    let trace_write_failure = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            trace_write_out_dir.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            &format!("rm -rf {}", trace_write_out_dir.display()),
+        ])
+        .output()
+        .expect("run trace write failure scenario");
+    assert_recorder_error(trace_write_failure, "trace_write_failure");
 }
 
 fn assert_recorder_error(output: Output, expected_code: &str) {

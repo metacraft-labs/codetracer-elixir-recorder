@@ -19,6 +19,7 @@
     next_thread_id = 2,
     last_thread_id = undefined,
     exited_pids = #{},
+    capture_messages = true,
     source_paths = [],
     manifest_paths = [],
     manifest_index = #{},
@@ -70,6 +71,7 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
     SourcePaths = proplists:get_value(source_paths, Options, []),
     ManifestPaths = proplists:get_value(manifest_paths, Options, []),
     TraceFunctions = proplists:get_value(trace_functions, Options, []),
+    CaptureMessages = proplists:get_value(capture_messages, Options, true),
     ok = filelib:ensure_dir(SessionFile),
     {ok, File} = file:open(SessionFile, [write, {encoding, utf8}]),
     ThreadId = 1,
@@ -80,8 +82,8 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
     persistent_term:put({codetracer_elixir_recorder, manifest_index}, ManifestIndex),
     ok = write_manifest_loaded(File, ManifestPaths, LoadedManifests),
     ok = install_trace_patterns(TraceFunctions),
-    ok = install_message_trace_patterns(),
-    erlang:trace(RootPid, true, [call, procs, send, 'receive', set_on_spawn, {tracer, self()}]),
+    ok = install_message_trace_patterns(CaptureMessages),
+    erlang:trace(RootPid, true, trace_flags(CaptureMessages)),
     ok = write_thread_event(File, "thread_start", ThreadId, RootPidText, SourcePaths),
     ok = write_thread_event(File, "thread_switch", ThreadId, RootPidText, SourcePaths),
     {reply, {ok, ThreadId}, State#state{
@@ -95,6 +97,7 @@ handle_call({start_session, Options}, {RootPid, _Tag}, State) ->
         next_runtime_variable_id = 1,
         next_thread_id = 2,
         last_thread_id = ThreadId,
+        capture_messages = CaptureMessages,
         source_paths = SourcePaths,
         manifest_paths = ManifestPaths,
         manifest_index = ManifestIndex,
@@ -105,7 +108,7 @@ handle_call({stop_session, Reason}, _From, State = #state{started = true, file =
     DeliveryRef = flush_trace_delivery(),
     StateAfterDrain = drain_trace_messages(File, State),
     ok = disable_traces(StateAfterDrain),
-    ok = clear_message_trace_patterns(),
+    ok = clear_message_trace_patterns(StateAfterDrain#state.capture_messages),
     ok = clear_trace_patterns(StateAfterDrain#state.trace_functions),
     persistent_term:erase({codetracer_elixir_recorder, manifests}),
     persistent_term:erase({codetracer_elixir_recorder, manifest_index}),
@@ -249,15 +252,29 @@ install_trace_patterns(TraceFunctions) ->
     ),
     ok.
 
-install_message_trace_patterns() ->
+install_message_trace_patterns(true) ->
     _ = erlang:trace_pattern(send, true, []),
     _ = erlang:trace_pattern('receive', [{['_', '$1', '_'], [], [{message, '$1'}]}], []),
+    ok;
+install_message_trace_patterns(false) ->
     ok.
 
-clear_message_trace_patterns() ->
+clear_message_trace_patterns(true) ->
     _ = erlang:trace_pattern(send, false, []),
     _ = erlang:trace_pattern('receive', false, []),
+    ok;
+clear_message_trace_patterns(false) ->
     ok.
+
+trace_flags(true) ->
+    [call, procs, send, 'receive', set_on_spawn, {tracer, self()}];
+trace_flags(false) ->
+    [call, procs, set_on_spawn, {tracer, self()}].
+
+trace_disable_flags(true) ->
+    [call, procs, send, 'receive', set_on_spawn];
+trace_disable_flags(false) ->
+    [call, procs, set_on_spawn].
 
 clear_trace_patterns(TraceFunctions) ->
     lists:foreach(
@@ -269,12 +286,12 @@ clear_trace_patterns(TraceFunctions) ->
     ),
     ok.
 
-disable_traces(#state{pid_threads = PidThreads}) ->
+disable_traces(#state{pid_threads = PidThreads, capture_messages = CaptureMessages}) ->
     maps:fold(
         fun(PidText, _ThreadId, ok) ->
             case list_to_pid_safe(PidText) of
                 {ok, Pid} ->
-                    _ = catch erlang:trace(Pid, false, [call, procs, send, 'receive', set_on_spawn]),
+                    _ = catch erlang:trace(Pid, false, trace_disable_flags(CaptureMessages)),
                     ok;
                 error ->
                     ok

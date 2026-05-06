@@ -49,8 +49,8 @@ fn run() -> Result<i32, RecorderDiagnostic> {
         "-h" | "--help" => print_help(),
         "-V" | "--version" | "version" => print_version(),
         "record" => return record_command("record", args),
-        "instrument" => return record_command("instrument", args),
-        "compile" => return record_command("compile", args),
+        "instrument" => return build_command("instrument", args),
+        "compile" => return build_command("compile", args),
         "writer-fixture" => write_fixture(args)
             .map(|_| ())
             .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?,
@@ -70,13 +70,25 @@ fn print_help() {
 
 Usage:
   {BINARY_NAME} record [OPTIONS] [--] COMMAND [ARGS...]
-  {BINARY_NAME} instrument [OPTIONS] [--] COMMAND [ARGS...]
-  {BINARY_NAME} compile [OPTIONS] [--] COMMAND [ARGS...]
+  {BINARY_NAME} instrument [OPTIONS] --source-dir PATH
+  {BINARY_NAME} compile [OPTIONS] --source-dir PATH
   {BINARY_NAME} version
 
 Options:
   -o, --out-dir PATH    Output directory for trace artifacts [default: ./ct-traces/]
   -f, --format FMT      Trace format: ctfs, binary, json [default: ctfs]
+      --build-dir PATH  Directory for instrumented BEAMs and recorder metadata
+      --source-dir PATH Erlang/generated Erlang source directory (repeatable)
+      --source-map PATH Sparse source map JSON file or directory (repeatable)
+      --include-module PATTERN Include module name pattern (repeatable)
+      --exclude-module PATTERN Exclude module name pattern (repeatable)
+      --root-mfa MFA    Root entrypoint as module:function/arity
+      --capture-messages BOOL Capture BEAM send/receive messages [default: true]
+      --value-max-depth N
+      --value-max-sequence-items N
+      --value-max-binary-bytes N
+      --value-max-map-pairs N
+      --value-max-string-bytes N
   -h, --help            Show this help text
   -V, --version         Show recorder version
 
@@ -110,9 +122,48 @@ fn record_command(subcommand: &'static str, args: Vec<String>) -> Result<i32, Re
             let mut session = RecordingSession::begin(subcommand, &options)?;
             let status = run_prepared_target(&session.prepared_target)?;
             let code = exit_code(status);
-            session.finish(code)?;
+            session.finish(code).map_err(|error| match error.code {
+                "writer_finalization_failed" => {
+                    RecorderDiagnostic::trace_write_failed(error.detail.unwrap_or(error.message))
+                }
+                _ => error,
+            })?;
             Ok(code)
         }
+    }
+}
+
+fn build_command(subcommand: &'static str, args: Vec<String>) -> Result<i32, RecorderDiagnostic> {
+    match parse_build_options(args.clone()) {
+        Ok(BuildParseResult::Help) => {
+            print_help();
+            Ok(0)
+        }
+        Ok(BuildParseResult::Version) => {
+            print_version();
+            Ok(0)
+        }
+        Ok(BuildParseResult::Build(options)) => {
+            let build = prepare_standalone_build(&options)?;
+            write_standalone_build_summary(&options.build_dir, subcommand, &build)
+                .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "subcommand": subcommand,
+                    "build_dir": options.build_dir,
+                    "instrumented_ebin": build.instrumented_ebin,
+                    "manifest_count": build.manifests.len(),
+                    "trace_function_count": build.trace_functions.len()
+                })
+            );
+            Ok(0)
+        }
+        Err(error) if should_fall_back_to_legacy_alias(&args, &error) => {
+            record_command(subcommand, args)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -120,6 +171,104 @@ fn recording_disabled() -> bool {
     env::var("CODETRACER_ELIXIR_RECORDER_DISABLED")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn default_standalone_build_dir() -> PathBuf {
+    PathBuf::from("_codetracer")
+        .join("elixir-recorder")
+        .join("standalone")
+}
+
+fn should_fall_back_to_legacy_alias(args: &[String], error: &RecorderDiagnostic) -> bool {
+    error.code == "invalid_arguments"
+        && args.iter().any(|arg| arg == "--")
+        && !args.iter().any(|arg| {
+            arg == "--source-dir"
+                || arg.starts_with("--source-dir=")
+                || arg == "--build-dir"
+                || arg.starts_with("--build-dir=")
+        })
+}
+
+fn parse_bool_flag(value: &str) -> Result<bool, RecorderDiagnostic> {
+    match value {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(RecorderDiagnostic::invalid_arguments(format!(
+            "expected boolean true/false, got {value}"
+        ))),
+    }
+}
+
+fn parse_u32_option(name: &str, value: Option<&String>) -> Result<u32, RecorderDiagnostic> {
+    let Some(value) = value else {
+        return Err(RecorderDiagnostic::invalid_arguments(format!(
+            "{name} requires a non-negative integer"
+        )));
+    };
+    value.parse::<u32>().map_err(|_| {
+        RecorderDiagnostic::invalid_arguments(format!(
+            "{name} requires a non-negative integer, got {value}"
+        ))
+    })
+}
+
+fn parse_root_mfa(value: &str) -> Result<RootMfa, RecorderDiagnostic> {
+    let Some((module, rest)) = value.split_once(':') else {
+        return Err(RecorderDiagnostic::invalid_arguments(format!(
+            "invalid root MFA {value}; expected module:function/arity"
+        )));
+    };
+    let Some((function, arity)) = rest.rsplit_once('/') else {
+        return Err(RecorderDiagnostic::invalid_arguments(format!(
+            "invalid root MFA {value}; expected module:function/arity"
+        )));
+    };
+    let arity = arity.parse::<u32>().map_err(|_| {
+        RecorderDiagnostic::invalid_arguments(format!(
+            "invalid root MFA arity in {value}; expected module:function/arity"
+        ))
+    })?;
+    Ok(RootMfa {
+        module: module.to_string(),
+        function: function.to_string(),
+        arity,
+    })
+}
+
+fn value_limit_env(value_limits: &ValueLimitOptions) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    if let Some(value) = value_limits.max_depth {
+        envs.push((
+            "CODETRACER_ELIXIR_VALUE_MAX_DEPTH".to_string(),
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = value_limits.max_sequence_items {
+        envs.push((
+            "CODETRACER_ELIXIR_VALUE_MAX_SEQUENCE_ITEMS".to_string(),
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = value_limits.max_binary_bytes {
+        envs.push((
+            "CODETRACER_ELIXIR_VALUE_MAX_BINARY_BYTES".to_string(),
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = value_limits.max_map_pairs {
+        envs.push((
+            "CODETRACER_ELIXIR_VALUE_MAX_MAP_PAIRS".to_string(),
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = value_limits.max_string_bytes {
+        envs.push((
+            "CODETRACER_ELIXIR_VALUE_MAX_STRING_BYTES".to_string(),
+            value.to_string(),
+        ));
+    }
+    envs
 }
 
 fn run_target(target: &[String]) -> Result<ExitStatus, RecorderDiagnostic> {
@@ -145,7 +294,13 @@ fn exit_code(status: ExitStatus) -> i32 {
 enum ParsedRecordCommand {
     Help,
     Version,
-    Record(RecordOptions),
+    Record(Box<RecordOptions>),
+}
+
+enum BuildParseResult {
+    Help,
+    Version,
+    Build(BuildOptions),
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +308,39 @@ struct RecordOptions {
     out_dir: PathBuf,
     format: OutputFormat,
     target: Vec<String>,
+    build_dir: Option<PathBuf>,
+    source_dirs: Vec<PathBuf>,
+    source_maps: Vec<PathBuf>,
+    include_modules: Vec<String>,
+    exclude_modules: Vec<String>,
+    root_mfa: Option<RootMfa>,
+    capture_messages: bool,
+    value_limits: ValueLimitOptions,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ValueLimitOptions {
+    max_depth: Option<u32>,
+    max_sequence_items: Option<u32>,
+    max_binary_bytes: Option<u32>,
+    max_map_pairs: Option<u32>,
+    max_string_bytes: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RootMfa {
+    module: String,
+    function: String,
+    arity: u32,
+}
+
+#[derive(Clone, Debug)]
+struct BuildOptions {
+    build_dir: PathBuf,
+    source_dirs: Vec<PathBuf>,
+    source_maps: Vec<PathBuf>,
+    include_modules: Vec<String>,
+    exclude_modules: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +370,14 @@ fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, Record
         Ok(value) => Some(OutputFormat::parse(&value)?),
         Err(_) => None,
     };
+    let mut build_dir = None;
+    let mut source_dirs = Vec::new();
+    let mut source_maps = Vec::new();
+    let mut include_modules = Vec::new();
+    let mut exclude_modules = Vec::new();
+    let mut root_mfa = None;
+    let mut capture_messages = true;
+    let mut value_limits = ValueLimitOptions::default();
     let mut target = Vec::new();
     let mut index = 0;
 
@@ -212,11 +408,115 @@ fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, Record
                 };
                 format = Some(OutputFormat::parse(value)?);
             }
+            "--build-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a path"
+                    )));
+                };
+                build_dir = Some(PathBuf::from(value));
+            }
+            "--source-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a path"
+                    )));
+                };
+                source_dirs.push(PathBuf::from(value));
+            }
+            "--source-map" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a path"
+                    )));
+                };
+                source_maps.push(PathBuf::from(value));
+            }
+            "--include-module" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a pattern"
+                    )));
+                };
+                include_modules.push(value.clone());
+            }
+            "--exclude-module" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a pattern"
+                    )));
+                };
+                exclude_modules.push(value.clone());
+            }
+            "--root-mfa" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires module:function/arity"
+                    )));
+                };
+                root_mfa = Some(parse_root_mfa(value)?);
+            }
+            "--capture-messages" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires true or false"
+                    )));
+                };
+                capture_messages = parse_bool_flag(value)?;
+            }
+            "--value-max-depth" => {
+                index += 1;
+                value_limits.max_depth = Some(parse_u32_option(arg, args.get(index))?);
+            }
+            "--value-max-sequence-items" => {
+                index += 1;
+                value_limits.max_sequence_items = Some(parse_u32_option(arg, args.get(index))?);
+            }
+            "--value-max-binary-bytes" => {
+                index += 1;
+                value_limits.max_binary_bytes = Some(parse_u32_option(arg, args.get(index))?);
+            }
+            "--value-max-map-pairs" => {
+                index += 1;
+                value_limits.max_map_pairs = Some(parse_u32_option(arg, args.get(index))?);
+            }
+            "--value-max-string-bytes" => {
+                index += 1;
+                value_limits.max_string_bytes = Some(parse_u32_option(arg, args.get(index))?);
+            }
             _ if arg.starts_with("--out-dir=") => {
                 out_dir = Some(PathBuf::from(arg.trim_start_matches("--out-dir=")));
             }
             _ if arg.starts_with("--format=") => {
                 format = Some(OutputFormat::parse(arg.trim_start_matches("--format="))?);
+            }
+            _ if arg.starts_with("--build-dir=") => {
+                build_dir = Some(PathBuf::from(arg.trim_start_matches("--build-dir=")));
+            }
+            _ if arg.starts_with("--source-dir=") => {
+                source_dirs.push(PathBuf::from(arg.trim_start_matches("--source-dir=")));
+            }
+            _ if arg.starts_with("--source-map=") => {
+                source_maps.push(PathBuf::from(arg.trim_start_matches("--source-map=")));
+            }
+            _ if arg.starts_with("--include-module=") => {
+                include_modules.push(arg.trim_start_matches("--include-module=").to_string());
+            }
+            _ if arg.starts_with("--exclude-module=") => {
+                exclude_modules.push(arg.trim_start_matches("--exclude-module=").to_string());
+            }
+            _ if arg.starts_with("--root-mfa=") => {
+                root_mfa = Some(parse_root_mfa(arg.trim_start_matches("--root-mfa="))?);
+            }
+            _ if arg.starts_with("--capture-messages=") => {
+                capture_messages = parse_bool_flag(arg.trim_start_matches("--capture-messages="))?;
             }
             _ if arg.starts_with('-') => {
                 return Err(RecorderDiagnostic::invalid_arguments(format!(
@@ -235,10 +535,121 @@ fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, Record
         return Err(RecorderDiagnostic::missing_target());
     }
 
-    Ok(ParsedRecordCommand::Record(RecordOptions {
+    Ok(ParsedRecordCommand::Record(Box::new(RecordOptions {
         out_dir: out_dir.unwrap_or_else(|| PathBuf::from("./ct-traces")),
         format: format.unwrap_or(OutputFormat::Ctfs),
         target,
+        build_dir,
+        source_dirs,
+        source_maps,
+        include_modules,
+        exclude_modules,
+        root_mfa,
+        capture_messages,
+        value_limits,
+    })))
+}
+
+fn parse_build_options(args: Vec<String>) -> Result<BuildParseResult, RecorderDiagnostic> {
+    let mut build_dir = None;
+    let mut source_dirs = Vec::new();
+    let mut source_maps = Vec::new();
+    let mut include_modules = Vec::new();
+    let mut exclude_modules = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(BuildParseResult::Help),
+            "-V" | "--version" => return Ok(BuildParseResult::Version),
+            "--build-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a path"
+                    )));
+                };
+                build_dir = Some(PathBuf::from(value));
+            }
+            "--source-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a path"
+                    )));
+                };
+                source_dirs.push(PathBuf::from(value));
+            }
+            "--source-map" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a path"
+                    )));
+                };
+                source_maps.push(PathBuf::from(value));
+            }
+            "--include-module" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a pattern"
+                    )));
+                };
+                include_modules.push(value.clone());
+            }
+            "--exclude-module" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a pattern"
+                    )));
+                };
+                exclude_modules.push(value.clone());
+            }
+            _ if arg.starts_with("--build-dir=") => {
+                build_dir = Some(PathBuf::from(arg.trim_start_matches("--build-dir=")));
+            }
+            _ if arg.starts_with("--source-dir=") => {
+                source_dirs.push(PathBuf::from(arg.trim_start_matches("--source-dir=")));
+            }
+            _ if arg.starts_with("--source-map=") => {
+                source_maps.push(PathBuf::from(arg.trim_start_matches("--source-map=")));
+            }
+            _ if arg.starts_with("--include-module=") => {
+                include_modules.push(arg.trim_start_matches("--include-module=").to_string());
+            }
+            _ if arg.starts_with("--exclude-module=") => {
+                exclude_modules.push(arg.trim_start_matches("--exclude-module=").to_string());
+            }
+            "--" => {
+                return Err(RecorderDiagnostic::invalid_arguments(
+                    "standalone instrument/compile do not execute target commands",
+                ));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(RecorderDiagnostic::invalid_arguments(format!(
+                    "unknown build option: {arg}"
+                )));
+            }
+            _ => source_dirs.push(PathBuf::from(arg)),
+        }
+        index += 1;
+    }
+
+    if source_dirs.is_empty() {
+        return Err(RecorderDiagnostic::invalid_arguments(
+            "compile/instrument requires --source-dir PATH",
+        ));
+    }
+
+    Ok(BuildParseResult::Build(BuildOptions {
+        build_dir: build_dir.unwrap_or_else(default_standalone_build_dir),
+        source_dirs,
+        source_maps,
+        include_modules,
+        exclude_modules,
     }))
 }
 
@@ -353,6 +764,38 @@ impl RecorderDiagnostic {
         )
     }
 
+    fn compile_failed(detail: impl Into<String>) -> Self {
+        Self::new(
+            "compile_failure",
+            "failed to compile instrumented Erlang build".to_string(),
+            Some(detail.into()),
+        )
+    }
+
+    fn source_map_failed(detail: impl Into<String>) -> Self {
+        Self::new(
+            "source_map_failure",
+            "failed to load source map".to_string(),
+            Some(detail.into()),
+        )
+    }
+
+    fn module_filter_mismatch(detail: impl Into<String>) -> Self {
+        Self::new(
+            "module_filter_mismatch",
+            "module filters matched no Erlang modules".to_string(),
+            Some(detail.into()),
+        )
+    }
+
+    fn trace_write_failed(detail: impl Into<String>) -> Self {
+        Self::new(
+            "trace_write_failure",
+            "failed to write trace artifacts".to_string(),
+            Some(detail.into()),
+        )
+    }
+
     fn target_spawn_failed(command: &str, error: io::Error) -> Self {
         Self::new(
             "target_spawn_failed",
@@ -396,7 +839,7 @@ impl RecordingSession {
     ) -> Result<Self, RecorderDiagnostic> {
         let program_name = target_program_name(&options.target[0]);
         let runtime = RuntimeSession::prepare(options)?;
-        let prepared_target = runtime.prepare_target(&options.target)?;
+        let prepared_target = runtime.prepare_target(options)?;
         let writer = panic::catch_unwind({
             let program_name = program_name.clone();
             let format = options.format.as_nim_format();
@@ -898,6 +1341,7 @@ struct RuntimeSession {
     transformed_form_dumps: Vec<TransformedFormsDump>,
     trace_functions: Vec<TraceFunctionSpec>,
     step_locations: Vec<TraceLocationSpec>,
+    capture_messages: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -906,7 +1350,7 @@ enum RuntimeMode {
     NonBeam,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CopiedSource {
     source_path: String,
     bundle_path: String,
@@ -915,7 +1359,7 @@ struct CopiedSource {
     trace_copy_path: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ManifestArtifact {
     module: String,
     manifest_id: String,
@@ -923,11 +1367,11 @@ struct ManifestArtifact {
     schema: String,
     build_path: String,
     trace_copy_path: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     runtime_path: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct SourceMapArtifact {
     source_language: String,
     generated_build_path: String,
@@ -935,13 +1379,13 @@ struct SourceMapArtifact {
     trace_copy_path: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct TransformedFormsDump {
     module: String,
     format: String,
     build_path: String,
     trace_copy_path: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     runtime_path: String,
 }
 
@@ -993,7 +1437,7 @@ struct RuntimeSidecarEvent {
     source_language: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct TraceLocationSpec {
     module: String,
     source_path: PathBuf,
@@ -1041,7 +1485,7 @@ struct RawVariableSlotTemplate {
     source: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct TraceFunctionSpec {
     module: String,
     function: String,
@@ -1249,6 +1693,25 @@ impl RuntimeSession {
         } else {
             RuntimeMode::NonBeam
         };
+        if mode == RuntimeMode::Beam {
+            if let Some(build_dir) = &options.build_dir {
+                return Self::prepare_from_standalone_build(options, build_dir);
+            }
+            if !options.source_dirs.is_empty() {
+                let build_dir = default_standalone_build_dir();
+                let build_options = BuildOptions {
+                    build_dir: build_dir.clone(),
+                    source_dirs: options.source_dirs.clone(),
+                    source_maps: options.source_maps.clone(),
+                    include_modules: options.include_modules.clone(),
+                    exclude_modules: options.exclude_modules.clone(),
+                };
+                let build = prepare_standalone_build(&build_options)?;
+                write_standalone_build_summary(&build_dir, "record", &build)
+                    .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+                return Self::prepare_from_standalone_build(options, &build_dir);
+            }
+        }
         let source_paths = if mode == RuntimeMode::Beam {
             discover_source_paths(&source_root)
                 .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
@@ -1295,6 +1758,7 @@ impl RuntimeSession {
                 &source_paths,
                 runtime_ebin,
                 &discovered_source_maps,
+                None,
             )
             .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
         } else {
@@ -1333,10 +1797,42 @@ impl RuntimeSession {
             transformed_form_dumps: instrumentation.dumps,
             trace_functions,
             step_locations: instrumentation.locations,
+            capture_messages: options.capture_messages,
         })
     }
 
-    fn prepare_target(&self, target: &[String]) -> Result<PreparedTarget, RecorderDiagnostic> {
+    fn prepare_from_standalone_build(
+        options: &RecordOptions,
+        build_dir: &Path,
+    ) -> Result<Self, RecorderDiagnostic> {
+        let build = read_standalone_build_summary(build_dir)?;
+        let copied_sources =
+            copy_sources(&options.out_dir, &build.source_root, &build.source_paths)
+                .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?;
+        let runtime_ebin = compile_runtime_app(build_dir, &options.target[0])
+            .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?;
+        Ok(Self {
+            mode: RuntimeMode::Beam,
+            session_file: options.out_dir.join("runtime_session.jsonl"),
+            runtime_ebin: Some(runtime_ebin),
+            instrumented_ebin: Some(build.instrumented_ebin),
+            source_root: build.source_root,
+            source_paths: build.source_paths,
+            copied_sources,
+            manifests: build.manifests,
+            source_maps: build.source_maps,
+            transformed_form_dumps: build.transformed_form_dumps,
+            trace_functions: build.trace_functions,
+            step_locations: build.step_locations,
+            capture_messages: options.capture_messages,
+        })
+    }
+
+    fn prepare_target(
+        &self,
+        options: &RecordOptions,
+    ) -> Result<PreparedTarget, RecorderDiagnostic> {
+        let target = &options.target;
         if self.mode == RuntimeMode::NonBeam {
             return Ok(PreparedTarget::plain(target.to_vec()));
         }
@@ -1347,16 +1843,18 @@ impl RuntimeSession {
             ));
         };
         let command_name = target_program_name(&target[0]);
-        match command_name.as_str() {
+        let mut prepared = match command_name.as_str() {
             "mix" => self.prepare_mix_target(target, runtime_ebin),
-            "erl" => self.prepare_erl_target(target, runtime_ebin),
+            "erl" => self.prepare_erl_target(target, runtime_ebin, options.root_mfa.as_ref()),
             "rebar3" => Err(RecorderDiagnostic::runtime_bootstrap_failed(
                 "Rebar3 runtime injection decision: use the same -pa runtime ebin plus wrapper bootstrap policy as plain erl; dedicated Rebar3 task integration is deferred past M4",
             )),
             other => Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
                 "unsupported BEAM target for M4 runtime injection: {other}"
             ))),
-        }
+        }?;
+        prepared.env.extend(value_limit_env(&options.value_limits));
+        Ok(prepared)
     }
 
     fn prepare_mix_target(
@@ -1389,12 +1887,19 @@ impl RuntimeSession {
         &self,
         target: &[String],
         runtime_ebin: &Path,
+        root_mfa: Option<&RootMfa>,
     ) -> Result<PreparedTarget, RecorderDiagnostic> {
         let mut args = target[1..].to_vec();
-        let Some((module, function)) = extract_erl_start_function(&mut args) else {
-            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
-                "M4 plain erl injection requires a -s Module Function target entry point",
-            ));
+        let (module, function) = if let Some(root_mfa) = root_mfa {
+            remove_root_mfa_start(&mut args, root_mfa);
+            (root_mfa.module.clone(), root_mfa.function.clone())
+        } else {
+            let Some((module, function)) = extract_erl_start_function(&mut args) else {
+                return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                    "plain erl injection requires -s Module Function or --root-mfa module:function/arity",
+                ));
+            };
+            (module, function)
         };
         remove_erl_init_stop(&mut args);
         args.push("-pa".to_string());
@@ -2076,6 +2581,150 @@ enum RuntimeCompiler {
     Elixir,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StandaloneBuildSummary {
+    schema: String,
+    build_dir: PathBuf,
+    source_root: PathBuf,
+    source_paths: Vec<PathBuf>,
+    instrumented_ebin: PathBuf,
+    manifests: Vec<ManifestArtifact>,
+    source_maps: Vec<SourceMapArtifact>,
+    transformed_form_dumps: Vec<TransformedFormsDump>,
+    trace_functions: Vec<TraceFunctionSpec>,
+    step_locations: Vec<TraceLocationSpec>,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleSelection {
+    include_modules: Vec<String>,
+    exclude_modules: Vec<String>,
+}
+
+fn prepare_standalone_build(
+    options: &BuildOptions,
+) -> Result<StandaloneBuildSummary, RecorderDiagnostic> {
+    let source_root = env::current_dir().map_err(|error| {
+        RecorderDiagnostic::compile_failed(format!("failed to read current directory: {error}"))
+    })?;
+    let source_paths = discover_build_source_paths(&options.source_dirs)
+        .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    let source_maps =
+        discover_and_load_source_maps(&source_root, &options.source_maps).map_err(|error| {
+            RecorderDiagnostic::source_map_failed(format!(
+                "source-map discovery failed under {}: {error}",
+                source_root.display()
+            ))
+        })?;
+    let selection = ModuleSelection {
+        include_modules: options.include_modules.clone(),
+        exclude_modules: options.exclude_modules.clone(),
+    };
+    let filtered_source_paths = filter_source_paths_for_modules(&source_paths, &selection)
+        .map_err(|error| match error {
+            BuildFilterError::Io(error) => RecorderDiagnostic::compile_failed(error.to_string()),
+            BuildFilterError::Mismatch(message) => {
+                RecorderDiagnostic::module_filter_mismatch(message)
+            }
+        })?;
+    let runtime_ebin = compile_runtime_app(&options.build_dir, "erl")
+        .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    let instrumentation = instrument_erlang_sources(
+        &options.build_dir,
+        &source_root,
+        &filtered_source_paths,
+        &runtime_ebin,
+        &source_maps,
+        Some(&selection),
+    )
+    .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    let trace_functions =
+        discover_trace_functions(&source_root, &filtered_source_paths, &source_maps)
+            .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    let (manifests, source_map_artifacts) = write_recorder_metadata(
+        &options.build_dir,
+        &source_root,
+        &trace_functions,
+        &instrumentation.locations,
+        &instrumentation.variable_slot_templates,
+        &source_maps,
+        &instrumentation.dumps,
+    )
+    .map_err(|error| RecorderDiagnostic::compile_failed(error.to_string()))?;
+    let instrumented_ebin = instrumentation.ebin_dir.ok_or_else(|| {
+        RecorderDiagnostic::compile_failed("no Erlang sources were compiled into instrumented ebin")
+    })?;
+    Ok(StandaloneBuildSummary {
+        schema: "codetracer.beam.standalone-build.v1".to_string(),
+        build_dir: options.build_dir.clone(),
+        source_root,
+        source_paths: filtered_source_paths,
+        instrumented_ebin,
+        manifests,
+        source_maps: source_map_artifacts,
+        transformed_form_dumps: instrumentation.dumps,
+        trace_functions,
+        step_locations: instrumentation.locations,
+    })
+}
+
+fn write_standalone_build_summary(
+    build_dir: &Path,
+    _subcommand: &str,
+    build: &StandaloneBuildSummary,
+) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(build_dir)?;
+    fs::write(
+        build_dir.join("standalone_build.json"),
+        serde_json::to_vec_pretty(build)?,
+    )?;
+    Ok(())
+}
+
+fn read_standalone_build_summary(
+    build_dir: &Path,
+) -> Result<StandaloneBuildSummary, RecorderDiagnostic> {
+    let path = build_dir.join("standalone_build.json");
+    let text = fs::read_to_string(&path).map_err(|error| {
+        RecorderDiagnostic::compile_failed(format!(
+            "missing standalone build manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut build: StandaloneBuildSummary = serde_json::from_str(&text).map_err(|error| {
+        RecorderDiagnostic::compile_failed(format!(
+            "invalid standalone build manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    if build.schema != "codetracer.beam.standalone-build.v1" {
+        return Err(RecorderDiagnostic::compile_failed(format!(
+            "unsupported standalone build schema {} in {}",
+            build.schema,
+            path.display()
+        )));
+    }
+    for manifest in &mut build.manifests {
+        if manifest.runtime_path.is_empty() {
+            manifest.runtime_path = build
+                .build_dir
+                .join(&manifest.trace_copy_path)
+                .display()
+                .to_string();
+        }
+    }
+    for dump in &mut build.transformed_form_dumps {
+        if dump.runtime_path.is_empty() {
+            dump.runtime_path = build
+                .build_dir
+                .join(&dump.trace_copy_path)
+                .display()
+                .to_string();
+        }
+    }
+    Ok(build)
+}
+
 fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, Box<dyn Error>> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src_dir = repo_root.join("apps/codetracer_erlang_runtime/src");
@@ -2170,6 +2819,29 @@ fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> 
     Ok(())
 }
 
+fn discover_build_source_paths(inputs: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        let path = normalize_build_path(input);
+        if path.is_dir() {
+            collect_source_paths(&path, &mut paths)?;
+        } else if path.is_file() && is_source_file(&path) {
+            paths.push(path);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "source input does not exist or is not a BEAM source: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn discover_source_maps(source_root: &Path) -> io::Result<Vec<SparseSourceMap>> {
     let mut paths = Vec::new();
     for dirname in ["source_maps", "codetracer_source_maps"] {
@@ -2179,6 +2851,39 @@ fn discover_source_maps(source_root: &Path) -> io::Result<Vec<SparseSourceMap>> 
         }
     }
 
+    load_source_maps(source_root, paths)
+}
+
+fn discover_and_load_source_maps(
+    source_root: &Path,
+    explicit_paths: &[PathBuf],
+) -> io::Result<Vec<SparseSourceMap>> {
+    let mut paths = Vec::new();
+    for dirname in ["source_maps", "codetracer_source_maps"] {
+        let dir = source_root.join(dirname);
+        if dir.is_dir() {
+            collect_json_paths(&dir, &mut paths)?;
+        }
+    }
+    for input in explicit_paths {
+        let path = normalize_build_path(input);
+        if path.is_dir() {
+            collect_json_paths(&path, &mut paths)?;
+        } else if path.is_file() {
+            paths.push(path);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("source map path does not exist: {}", path.display()),
+            ));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    load_source_maps(source_root, paths)
+}
+
+fn load_source_maps(source_root: &Path, paths: Vec<PathBuf>) -> io::Result<Vec<SparseSourceMap>> {
     let mut source_maps = Vec::new();
     for path in paths {
         let text = fs::read_to_string(&path)?;
@@ -2228,12 +2933,105 @@ fn collect_json_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+enum BuildFilterError {
+    Io(io::Error),
+    Mismatch(String),
+}
+
+fn filter_source_paths_for_modules(
+    source_paths: &[PathBuf],
+    selection: &ModuleSelection,
+) -> Result<Vec<PathBuf>, BuildFilterError> {
+    let has_filters =
+        !selection.include_modules.is_empty() || !selection.exclude_modules.is_empty();
+    if !has_filters {
+        return Ok(source_paths.to_vec());
+    }
+
+    let mut selected = Vec::new();
+    let mut discovered_modules = Vec::new();
+    for path in source_paths {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("erl") {
+            selected.push(path.clone());
+            continue;
+        }
+        let module = erlang_module_name(path).map_err(BuildFilterError::Io)?;
+        discovered_modules.push(module.clone());
+        if module_selected(&module, selection) {
+            selected.push(path.clone());
+        }
+    }
+
+    let selected_erlang = selected
+        .iter()
+        .any(|path| path.extension().and_then(|extension| extension.to_str()) == Some("erl"));
+    if !selected_erlang {
+        return Err(BuildFilterError::Mismatch(format!(
+            "include={:?} exclude={:?} discovered={:?}",
+            selection.include_modules, selection.exclude_modules, discovered_modules
+        )));
+    }
+    Ok(selected)
+}
+
+fn erlang_module_name(path: &Path) -> io::Result<String> {
+    let text = fs::read_to_string(path)?;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("-module(") {
+            if let Some((name, _)) = rest.split_once(')') {
+                return Ok(name.trim().trim_matches('\'').to_string());
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("missing -module attribute in {}", path.display()),
+    ))
+}
+
+fn module_selected(module: &str, selection: &ModuleSelection) -> bool {
+    let included = selection.include_modules.is_empty()
+        || selection
+            .include_modules
+            .iter()
+            .any(|pattern| wildcard_match(pattern, module));
+    let excluded = selection
+        .exclude_modules
+        .iter()
+        .any(|pattern| wildcard_match(pattern, module));
+    included && !excluded
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    wildcard_match_bytes(pattern.as_bytes(), value.as_bytes())
+}
+
+fn wildcard_match_bytes(pattern: &[u8], value: &[u8]) -> bool {
+    match (pattern.split_first(), value.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&b'*', rest)), _) => {
+            wildcard_match_bytes(rest, value)
+                || value
+                    .split_first()
+                    .is_some_and(|(_, tail)| wildcard_match_bytes(pattern, tail))
+        }
+        (Some((&b'?', rest)), Some((_, tail))) => wildcard_match_bytes(rest, tail),
+        (Some((&left, rest)), Some((&right, tail))) if left == right => {
+            wildcard_match_bytes(rest, tail)
+        }
+        _ => false,
+    }
+}
+
 fn instrument_erlang_sources(
     out_dir: &Path,
     source_root: &Path,
     source_paths: &[PathBuf],
     runtime_ebin: &Path,
     source_maps: &[SparseSourceMap],
+    _selection: Option<&ModuleSelection>,
 ) -> Result<InstrumentationArtifacts, Box<dyn Error>> {
     let erlang_sources = source_paths
         .iter()
@@ -3044,15 +3842,13 @@ fn copy_sources(
     let mut copied = Vec::new();
     for source_path in source_paths {
         let source_path = normalize_build_path(source_path);
-        let relative = source_path
-            .strip_prefix(source_root)
-            .unwrap_or(&source_path);
-        let destination = compatibility_bundle_root.join(relative);
+        let relative = bundle_relative_path(source_root, &source_path);
+        let destination = compatibility_bundle_root.join(&relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::copy(&source_path, &destination)?;
-        let files_destination = files_bundle_root.join(relative);
+        let files_destination = files_bundle_root.join(&relative);
         if let Some(parent) = files_destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -3068,6 +3864,16 @@ fn copy_sources(
         });
     }
     Ok(copied)
+}
+
+fn bundle_relative_path(source_root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(source_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty() && !relative.is_absolute())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("external").join(safe_filename(&path.display().to_string()))
+        })
 }
 
 fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String {
@@ -3094,7 +3900,7 @@ fn wrap_erlang_entrypoint(module: &str, function: &str, runtime: &RuntimeSession
 
 fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
-        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}]",
+        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}, {{:capture_messages, {capture_messages}}}]",
         session_file = elixir_charlist(&runtime.session_file.display().to_string()),
         source_paths = elixir_charlist_list(&runtime.source_paths),
         manifest_paths = elixir_string_list(
@@ -3104,13 +3910,14 @@ fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
                 .map(|manifest| manifest.runtime_path.clone())
                 .collect::<Vec<_>>()
         ),
-        trace_functions = elixir_trace_function_list(&runtime.trace_functions)
+        trace_functions = elixir_trace_function_list(&runtime.trace_functions),
+        capture_messages = runtime.capture_messages
     )
 }
 
 fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
-        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{manifest_paths,{manifest_paths}}},{{trace_functions,{trace_functions}}}]",
+        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{manifest_paths,{manifest_paths}}},{{trace_functions,{trace_functions}}},{{capture_messages,{capture_messages}}}]",
         session_file = erlang_string(&runtime.session_file.display().to_string()),
         source_paths = erlang_string_list(&runtime.source_paths),
         manifest_paths = erlang_string_vec(
@@ -3120,7 +3927,8 @@ fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
                 .map(|manifest| manifest.runtime_path.clone())
                 .collect::<Vec<_>>()
         ),
-        trace_functions = erlang_trace_function_list(&runtime.trace_functions)
+        trace_functions = erlang_trace_function_list(&runtime.trace_functions),
+        capture_messages = runtime.capture_messages
     )
 }
 
@@ -3289,6 +4097,25 @@ fn remove_erl_init_stop(args: &mut Vec<String>) {
         } else {
             index += 1;
         }
+    }
+}
+
+fn remove_root_mfa_start(args: &mut Vec<String>, root_mfa: &RootMfa) {
+    let mut index = 0;
+    while index + 1 < args.len() {
+        if args[index] == "-s" && args[index + 1] == root_mfa.module {
+            let remove_count = if args
+                .get(index + 2)
+                .is_some_and(|value| !value.starts_with('-'))
+            {
+                3
+            } else {
+                2
+            };
+            args.drain(index..index + remove_count);
+            return;
+        }
+        index += 1;
     }
 }
 
