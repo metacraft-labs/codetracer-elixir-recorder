@@ -1,0 +1,7 @@
+{application, rebar3_app,
+ [{description, "CodeTracer Rebar3 fixture"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []}]}.

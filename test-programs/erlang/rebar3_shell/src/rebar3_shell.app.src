@@ -1,0 +1,7 @@
+{application, rebar3_shell,
+ [{description, "CodeTracer Rebar3 shell fixture"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []}]}.

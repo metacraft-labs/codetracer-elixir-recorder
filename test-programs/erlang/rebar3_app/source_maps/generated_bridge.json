@@ -1,0 +1,22 @@
+{
+  "schema": "codetracer.beam.sourcemap.v1",
+  "source_language": "elixir",
+  "generated_path": "src/rebar3_generated.erl",
+  "original_path": "lib/original_generated.ex",
+  "mappings": [
+    {
+      "generated_line": 6,
+      "generated_column": null,
+      "original_line": 3,
+      "original_column": null,
+      "reason": "rebar3_generated_fixture"
+    },
+    {
+      "generated_line": 7,
+      "generated_column": null,
+      "original_line": 4,
+      "original_column": null,
+      "reason": "rebar3_generated_fixture"
+    }
+  ]
+}

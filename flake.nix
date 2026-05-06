@@ -79,6 +79,7 @@
                   clippy
                   just
                   nixfmt
+                  rebar3
                   rustc
                   rustfmt
                   shellcheck
@@ -103,6 +104,7 @@
                 jq
                 nixfmt
                 pkg-config
+                rebar3
                 rustc
                 rustfmt
                 shellcheck

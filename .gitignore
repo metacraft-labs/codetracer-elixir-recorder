@@ -3,3 +3,8 @@
 /result-*
 /.direnv/
 /.pre-commit-config.yaml
+rebar3_codetracer/_build/
+test-programs/erlang/**/_build/
+test-programs/erlang/**/_checkouts/
+test-programs/erlang/**/ct-traces/
+test-programs/erlang/**/ct-traces-*/

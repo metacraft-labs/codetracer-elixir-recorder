@@ -1,0 +1,7 @@
+{application, rebar3_codetracer,
+ [{description, "CodeTracer Rebar3 integration provider"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []}]}.

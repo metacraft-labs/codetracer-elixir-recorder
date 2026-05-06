@@ -1848,9 +1848,7 @@ impl RuntimeSession {
         let mut prepared = match command_name.as_str() {
             "mix" => self.prepare_mix_target(target, runtime_ebin),
             "erl" => self.prepare_erl_target(target, runtime_ebin, options.root_mfa.as_ref()),
-            "rebar3" => Err(RecorderDiagnostic::runtime_bootstrap_failed(
-                "Rebar3 runtime injection decision: use the same -pa runtime ebin plus wrapper bootstrap policy as plain erl; dedicated Rebar3 task integration is deferred past M4",
-            )),
+            "rebar3" => self.prepare_rebar3_target(target, runtime_ebin),
             other => Err(RecorderDiagnostic::runtime_bootstrap_failed(format!(
                 "unsupported BEAM target for M4 runtime injection: {other}"
             ))),
@@ -1921,6 +1919,46 @@ impl RuntimeSession {
                 "plain erl M4 injection plus M8 instrumentation: add -pa compiled runtime ebin and instrumented ebin, replace -s entrypoint/-s init stop with an -eval wrapper that starts and stops the runtime session"
                     .to_string(),
         })
+    }
+
+    fn prepare_rebar3_target(
+        &self,
+        target: &[String],
+        _runtime_ebin: &Path,
+    ) -> Result<PreparedTarget, RecorderDiagnostic> {
+        let mut prepared = PreparedTarget::plain(target.to_vec());
+        let Some(shell_index) = prepared.args.iter().position(|arg| arg == "shell") else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "Rebar3 injection requires a rebar3 shell target",
+            ));
+        };
+        let eval_index = prepared
+            .args
+            .iter()
+            .enumerate()
+            .skip(shell_index + 1)
+            .find_map(|(index, arg)| {
+                if arg == "--eval" {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                RecorderDiagnostic::runtime_bootstrap_failed(
+                    "Rebar3 shell injection requires --eval so the runtime can start and stop deterministically",
+                )
+            })?;
+        let Some(expression) = prepared.args.get(eval_index + 1).cloned() else {
+            return Err(RecorderDiagnostic::runtime_bootstrap_failed(
+                "Rebar3 shell --eval is missing an expression to wrap",
+            ));
+        };
+        prepared.args[eval_index + 1] = wrap_rebar3_shell_eval(&expression, self);
+        prepared.injection_decision =
+            "Rebar3 M13 injection: run a real rebar3 shell under the codetrace profile, add runtime and isolated instrumented ebin paths, wrap shell --eval with start_session/stop_session, then halt"
+                .to_string();
+        Ok(prepared)
     }
 
     fn read_delivery(&self) -> Result<RuntimeDelivery, RecorderDiagnostic> {
@@ -3941,6 +3979,42 @@ fn wrap_erlang_entrypoint(module: &str, function: &str, runtime: &RuntimeSession
     )
 }
 
+fn wrap_rebar3_shell_eval(expression: &str, runtime: &RuntimeSession) -> String {
+    let runtime_ebin = runtime
+        .runtime_ebin
+        .as_ref()
+        .map(|path| erlang_string(&path.display().to_string()))
+        .unwrap_or_else(|| "\"\"".to_string());
+    let instrumented_path = runtime
+        .instrumented_ebin
+        .as_ref()
+        .map(|path| {
+            format!(
+                "code:add_patha({}),{}",
+                erlang_string(&path.display().to_string()),
+                erlang_purge_trace_modules(&runtime.trace_functions)
+            )
+        })
+        .unwrap_or_default();
+    let expression = erlang_eval_expression_body(expression);
+    format!(
+        "code:add_patha({runtime_ebin}),{instrumented_path}codetracer_erlang_runtime:start_session({options}), try begin {expression} end of _ -> codetracer_erlang_runtime:stop_session(normal), halt(0) catch Class:Reason:Stack -> codetracer_erlang_runtime:stop_session({{Class,Reason}}), erlang:raise(Class, Reason, Stack) end.",
+        runtime_ebin = runtime_ebin,
+        instrumented_path = instrumented_path,
+        options = erlang_runtime_options(runtime),
+        expression = expression
+    )
+}
+
+fn erlang_eval_expression_body(expression: &str) -> String {
+    expression
+        .trim()
+        .strip_suffix('.')
+        .unwrap_or_else(|| expression.trim())
+        .trim()
+        .to_string()
+}
+
 fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
         "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}, {{:capture_messages, {capture_messages}}}]",
@@ -3994,6 +4068,23 @@ fn elixir_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
             format!(
                 ":code.purge({module})\n:code.delete({module})\n",
                 module = elixir_atom(module)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn erlang_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
+    let modules = functions
+        .iter()
+        .map(|function| function.module.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    modules
+        .iter()
+        .map(|module| {
+            format!(
+                "code:purge({module}),code:delete({module}),",
+                module = erlang_atom(module)
             )
         })
         .collect::<Vec<_>>()

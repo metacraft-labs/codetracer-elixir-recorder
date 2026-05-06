@@ -3,6 +3,7 @@ use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codetracer_ctfs::CtfsReader;
@@ -316,6 +317,58 @@ fn record_mix_task_eval(
         .env("CODETRACER_ELIXIR_RECORDER_ROOT", repo_root())
         .output()
         .expect("run mix codetracer.record");
+
+    RecordedTrace {
+        out_dir,
+        build_dir: Some(build_dir),
+        output,
+    }
+}
+
+fn record_rebar3_profile(
+    label: &str,
+    fixture_name: &str,
+    profile: &str,
+    extra_args: &[&str],
+) -> RecordedTrace {
+    static REBAR3_FIXTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = REBAR3_FIXTURE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock Rebar3 fixture");
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let build_dir = tmp.join("codetracer-build");
+    let fixture_dir = repo_root().join("test-programs/erlang").join(fixture_name);
+    let _ = fs::remove_dir_all(fixture_dir.join("_build"));
+    let _ = fs::remove_dir_all(fixture_dir.join("ct-traces"));
+    let _ = fs::remove_dir_all(fixture_dir.join("ct-traces-parse-transform"));
+    let checkouts = fixture_dir.join("_checkouts");
+    fs::create_dir_all(&checkouts).expect("create fixture _checkouts");
+    let checkout_link = checkouts.join("rebar3_codetracer");
+    let _ = fs::remove_file(&checkout_link);
+    let _ = fs::remove_dir_all(&checkout_link);
+    std::os::unix::fs::symlink(repo_root().join("rebar3_codetracer"), &checkout_link)
+        .expect("link local rebar3_codetracer plugin checkout");
+
+    let mut args = vec![
+        "as",
+        profile,
+        "codetracer",
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--build-dir",
+        build_dir.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra_args);
+
+    let output = Command::new("rebar3")
+        .args(args)
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .env("CODETRACER_ELIXIR_RECORDER_BIN", recorder_binary())
+        .output()
+        .expect("run rebar3 codetracer provider");
 
     RecordedTrace {
         out_dir,
@@ -2092,6 +2145,242 @@ fn e2e_elixir_macro_source_mapping_real_trace() {
                 && event["source_location"]["resolution"] == "source_map"
         }),
         "runtime should record macro-generated function calls with source mapping: {events:#?}"
+    );
+}
+
+#[test]
+fn e2e_rebar3_profile_records_real_app() {
+    let recorded = record_rebar3_profile("m13-rebar3-profile", "rebar3_app", "codetrace", &[]);
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        output_text(&recorded.output).contains("52"),
+        "rebar3 shell should execute the real fixture main/0: {}",
+        output_text(&recorded.output)
+    );
+
+    let build_dir = recorded.build_dir.as_ref().expect("rebar3 build dir");
+    assert!(
+        build_dir
+            .join("instrumented/ebin/rebar3_app.beam")
+            .is_file(),
+        "provider mode should write isolated instrumented BEAMs under {}",
+        build_dir.display()
+    );
+    let fixture_dir = repo_root().join("test-programs/erlang/rebar3_app");
+    assert!(
+        !fixture_dir
+            .join("_build/default/lib/rebar3_app/ebin/rebar3_app.beam")
+            .exists(),
+        "codetrace profile must not mutate default Rebar3 build artifacts"
+    );
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert_eq!(meta["runtime_session"]["mode"], "beam");
+    assert!(
+        meta["runtime_session"]["injection_decision"]
+            .as_str()
+            .is_some_and(|decision| decision.contains("Rebar3 M13 injection")),
+        "trace metadata should record Rebar3 runtime injection: {meta:#?}"
+    );
+    assert!(
+        meta["sources"].as_array().is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source["trace_copy_path"] == "files/src/rebar3_app.erl")
+                && sources
+                    .iter()
+                    .any(|source| source["trace_copy_path"] == "files/lib/original_generated.ex")
+        }),
+        "trace bundle should include Rebar3 source files and generated-source originals: {meta:#?}"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    assert!(
+        manifests
+            .iter()
+            .any(|manifest| manifest["module"]["name"] == "rebar3_app"),
+        "missing rebar3_app manifest: {manifests:#?}"
+    );
+    assert!(
+        !manifests
+            .iter()
+            .any(|manifest| manifest["module"]["name"] == "rebar3_ignored"),
+        "module filters should exclude rebar3_ignored: {manifests:#?}"
+    );
+    let generated_manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "rebar3_generated")
+        .unwrap_or_else(|| panic!("missing generated Rebar3 manifest: {manifests:#?}"));
+    assert!(
+        generated_manifest["locations"]
+            .as_array()
+            .is_some_and(|locations| {
+                locations.iter().any(|location| {
+                    location["resolution"] == "source_map"
+                        && location["trace_copy_path"] == "files/lib/original_generated.ex"
+                })
+            }),
+        "generated Erlang source map should resolve to original source: {generated_manifest:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "rebar3.ct");
+    assert!(
+        reader.step_count() > 0,
+        "Rebar3 CTFS trace should contain steps"
+    );
+    assert!(
+        reader_function_names(&reader)
+            .iter()
+            .any(|name| name.contains("rebar3_app:main/0")),
+        "reader should expose real Rebar3 function names"
+    );
+
+    let filtered_out = record_rebar3_profile(
+        "m13-rebar3-app-filter-mismatch",
+        "rebar3_app",
+        "codetrace",
+        &["--exclude-app", "rebar3_app"],
+    );
+    assert_ne!(
+        filtered_out.output.status.code(),
+        Some(0),
+        "app filters should be enforced by the real Rebar3 provider"
+    );
+    assert!(
+        output_text(&filtered_out.output).contains("module_filter_mismatch"),
+        "app filter mismatch should fail clearly: {}",
+        output_text(&filtered_out.output)
+    );
+}
+
+#[test]
+fn e2e_rebar3_shell_runtime_trace() {
+    let recorded = record_rebar3_profile("m13-rebar3-shell", "rebar3_shell", "codetrace", &[]);
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        output_text(&recorded.output).contains("42"),
+        "rebar3 shell should run worker fixture: {}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"] == "call" && event["module"] == "rebar3_shell"),
+        "runtime should trace calls from the real Rebar3 shell: {events:#?}"
+    );
+    let messages = sidecar_message_events(&events);
+    assert!(
+        messages
+            .iter()
+            .any(|event| event["tag"] == "worker_result" && event["direction"] == "send"),
+        "runtime should trace shell fixture send events: {messages:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|event| event["tag"] == "worker_result" && event["direction"] == "receive"),
+        "runtime should trace shell fixture receive events: {messages:#?}"
+    );
+    assert_reader_trace_log_contains(&recorded.out_dir, "rebar3.ct", &["worker_result"]);
+}
+
+#[test]
+fn e2e_rebar3_parse_transform_compat() {
+    let provider = record_rebar3_profile(
+        "m13-rebar3-provider-baseline",
+        "rebar3_app",
+        "codetrace",
+        &[
+            "--include-module",
+            "rebar3_app",
+            "--include-module",
+            "rebar3_helper",
+        ],
+    );
+    assert_eq!(
+        provider.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&provider.output)
+    );
+
+    let compat = record_rebar3_profile(
+        "m13-rebar3-parse-transform",
+        "rebar3_app",
+        "codetrace_parse_transform",
+        &[
+            "--profile",
+            "codetrace_parse_transform",
+            "--parse-transform",
+            "--include-module",
+            "rebar3_app",
+            "--include-module",
+            "rebar3_helper",
+        ],
+    );
+    assert_eq!(
+        compat.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&compat.output)
+    );
+
+    let marker_dir = compat
+        .build_dir
+        .as_ref()
+        .expect("compat build dir")
+        .join("parse_transform_markers");
+    assert!(
+        marker_dir.join("rebar3_app.marker").is_file(),
+        "parse-transform compatibility mode should compile through the real parse transform"
+    );
+
+    let provider_calls = runtime_sidecar_events(&provider.out_dir)
+        .into_iter()
+        .filter(|event| event["event"] == "call")
+        .filter_map(|event| {
+            Some(format!(
+                "{}:{}",
+                event["module"].as_str()?,
+                event["function"].as_str()?
+            ))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let compat_calls = runtime_sidecar_events(&compat.out_dir)
+        .into_iter()
+        .filter(|event| event["event"] == "call")
+        .filter_map(|event| {
+            Some(format!(
+                "{}:{}",
+                event["module"].as_str()?,
+                event["function"].as_str()?
+            ))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for expected in ["rebar3_app:main", "rebar3_helper:add"] {
+        assert!(
+            provider_calls.contains(expected) && compat_calls.contains(expected),
+            "parse-transform mode should preserve provider-supported call events; provider={provider_calls:#?} compat={compat_calls:#?}"
+        );
+    }
+
+    let reader = open_named_trace(&compat.out_dir, "rebar3.ct");
+    assert!(
+        reader.call_count() > 0,
+        "parse-transform compatibility trace should be readable through the real CTFS reader"
     );
 }
 
