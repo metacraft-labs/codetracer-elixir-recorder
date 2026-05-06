@@ -17,4 +17,12 @@ defmodule CanonicalFlow do
     IO.puts(result)
     result
   end
+
+  def raises do
+    raise "m5 fixture exception"
+  end
+
+  def identity(value) do
+    value
+  end
 end

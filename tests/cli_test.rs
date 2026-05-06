@@ -1,9 +1,12 @@
 use std::fs;
+use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use codetracer_ctfs::CtfsReader;
+use codetracer_trace_types::ValueRecord;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use serde_json::Value;
 
@@ -54,6 +57,11 @@ fn assert_success(output: &Output, context: &str) {
     );
 }
 
+struct RecordedTrace {
+    out_dir: PathBuf,
+    output: Output,
+}
+
 fn compile_elixir_fixture(fixture_dir: &Path, build_root: &Path) {
     let clean = Command::new("mix")
         .arg("clean")
@@ -93,6 +101,196 @@ fn compile_erlang_fixture(ebin_dir: &Path) {
     }
 }
 
+fn record_elixir_expression(label: &str, expression: &str) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let elixir_fixture = repo_root().join("test-programs/elixir/canonical_flow");
+    let mix_build_root = tmp.join("mix-build");
+    compile_elixir_fixture(&elixir_fixture, &mix_build_root);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "mix",
+            "run",
+            "--no-compile",
+            "-e",
+            expression,
+        ])
+        .current_dir(&elixir_fixture)
+        .env("MIX_ENV", "test")
+        .env("MIX_BUILD_ROOT", &mix_build_root)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Elixir expression under runtime session");
+
+    RecordedTrace { out_dir, output }
+}
+
+fn open_mix_trace(out_dir: &Path) -> NimTraceReaderHandle {
+    let ct_path = out_dir.join("mix.ct");
+    assert!(
+        ct_path.is_file(),
+        "expected CTFS trace at {}",
+        ct_path.display()
+    );
+    NimTraceReaderHandle::open(ct_path.to_str().expect("trace path utf-8"))
+        .expect("open runtime CTFS trace through real reader bridge")
+}
+
+fn runtime_sidecar_events(out_dir: &Path) -> Vec<Value> {
+    let sidecar_path = out_dir.join("runtime_session.jsonl");
+    let sidecar = fs::read_to_string(&sidecar_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", sidecar_path.display()));
+    sidecar
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("runtime sidecar JSON line"))
+        .collect()
+}
+
+fn raw_ctfs_call_return_values(out_dir: &Path) -> Vec<String> {
+    let ct_path = out_dir.join("mix.ct");
+    assert!(
+        ct_path.is_file(),
+        "expected CTFS trace at {}",
+        ct_path.display()
+    );
+    let mut reader = CtfsReader::open(&ct_path).expect("open CTFS container");
+    let calls = reader.read_file("calls.dat").expect("read CTFS calls.dat");
+    let offsets = reader.read_file("calls.off").expect("read CTFS calls.off");
+    call_record_slices(&calls, &offsets)
+        .into_iter()
+        .map(|record| {
+            decode_first_value_record(record).unwrap_or_else(|| {
+                panic!("call record should contain a CBOR return value: {record:02x?}")
+            })
+        })
+        .map(|value| trace_value_text(&value))
+        .collect()
+}
+
+fn call_record_slices<'a>(calls: &'a [u8], offsets: &[u8]) -> Vec<&'a [u8]> {
+    let mut parsed_offsets = offsets
+        .chunks_exact(8)
+        .map(|chunk| {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(chunk);
+            u64::from_le_bytes(bytes) as usize
+        })
+        .collect::<Vec<_>>();
+    parsed_offsets.retain(|offset| *offset <= calls.len());
+    parsed_offsets
+        .windows(2)
+        .filter_map(|window| calls.get(window[0]..window[1]))
+        .filter(|record| !record.is_empty())
+        .collect()
+}
+
+fn decode_first_value_record(record: &[u8]) -> Option<ValueRecord> {
+    (0..record.len()).find_map(|offset| {
+        cbor4ii::serde::from_reader::<ValueRecord, _>(Cursor::new(&record[offset..])).ok()
+    })
+}
+
+fn trace_value_text(value: &ValueRecord) -> String {
+    match value {
+        ValueRecord::Int { i, .. } => i.to_string(),
+        ValueRecord::Raw { r, .. } => r.clone(),
+        ValueRecord::None { .. } => "None".to_string(),
+        other => serde_json::to_string(other).expect("serialize trace value"),
+    }
+}
+
+fn reader_function_names(reader: &NimTraceReaderHandle) -> Vec<String> {
+    (0..reader.function_count())
+        .filter_map(|id| reader.function(id).ok())
+        .map(|raw| normalize_function_json(&raw))
+        .collect()
+}
+
+fn reader_call_function_names(reader: &NimTraceReaderHandle) -> Vec<String> {
+    (0..reader.call_count())
+        .filter_map(|key| reader.call_json(key).ok())
+        .filter_map(|raw| {
+            let json = serde_json::from_str::<Value>(&raw).ok()?;
+            if let Some(name) = find_string_for_keys(&json, &["function", "function_name", "name"])
+            {
+                return Some(name);
+            }
+            let function_id =
+                find_u64_for_keys(&json, &["function_id", "functionId", "functionID"])?;
+            reader
+                .function(function_id)
+                .ok()
+                .map(|function| normalize_function_json(&function))
+        })
+        .collect()
+}
+
+fn normalize_function_json(raw: &str) -> String {
+    let Ok(json) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+    if let Some(name) = json.as_str() {
+        return name.to_string();
+    }
+    find_string_for_keys(&json, &["name", "function", "function_name"])
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn find_string_for_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(text) = map.get(*key).and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+            map.values()
+                .find_map(|nested| find_string_for_keys(nested, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|nested| find_string_for_keys(nested, keys)),
+        _ => None,
+    }
+}
+
+fn find_u64_for_keys(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(id) = map.get(*key).and_then(Value::as_u64) {
+                    return Some(id);
+                }
+            }
+            map.values()
+                .find_map(|nested| find_u64_for_keys(nested, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|nested| find_u64_for_keys(nested, keys)),
+        _ => None,
+    }
+}
+
+fn decode_reader_event_content(event_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(event_json) else {
+        return event_json.to_string();
+    };
+    let Some(bytes) = value.get("data").and_then(Value::as_array) else {
+        return event_json.to_string();
+    };
+    let bytes = bytes
+        .iter()
+        .filter_map(|byte| byte.as_u64().and_then(|value| u8::try_from(value).ok()))
+        .collect::<Vec<_>>();
+    String::from_utf8(bytes).unwrap_or_else(|_| event_json.to_string())
+}
+
 #[test]
 fn e2e_runtime_session_records_real_elixir_process() {
     let tmp = temp_dir("runtime-elixir");
@@ -127,6 +325,142 @@ fn e2e_runtime_session_records_real_elixir_process() {
         "mix.ct",
         "Mix M4 injection",
         "lib/canonical_flow.ex",
+    );
+}
+
+#[test]
+fn e2e_runtime_records_canonical_call_return_sequence() {
+    let recorded = record_elixir_expression("m5-call-return", "CanonicalFlow.main()");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(String::from_utf8_lossy(&recorded.output.stdout), "94\n");
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    let observed = events
+        .iter()
+        .filter_map(|event| match event["event"].as_str()? {
+            "call" => Some(format!(
+                "call {}.{}/{}",
+                event["module"].as_str()?,
+                event["function"].as_str()?,
+                event["arity"].as_u64()?
+            )),
+            "return_from" => Some(format!(
+                "return {}.{}/{}={}",
+                event["module"].as_str()?,
+                event["function"].as_str()?,
+                event["arity"].as_u64()?,
+                event["return_value"]
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![
+            "call Elixir.CanonicalFlow.main/0",
+            "call Elixir.CanonicalFlow.compute/0",
+            "return Elixir.CanonicalFlow.compute/0=94",
+            "return Elixir.CanonicalFlow.main/0=94",
+        ]
+    );
+
+    let reader = open_mix_trace(&recorded.out_dir);
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names.iter().any(|name| name == "CanonicalFlow.main/0")
+            && call_names
+                .iter()
+                .any(|name| name == "CanonicalFlow.compute/0"),
+        "reader should expose canonical call records after sidecar sequence validation: {call_names:#?}"
+    );
+
+    assert_eq!(
+        raw_ctfs_call_return_values(&recorded.out_dir),
+        vec!["94", "94"],
+        "raw CTFS calls.dat should contain return values for compute/0 and main/0"
+    );
+}
+
+#[test]
+fn e2e_runtime_records_real_exception_fixture() {
+    let recorded = record_elixir_expression("m5-exception", "CanonicalFlow.raises()");
+    assert!(
+        !recorded.output.status.success(),
+        "exception fixture should propagate target failure\n{}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "exception_from"
+                && event["module"] == "Elixir.CanonicalFlow"
+                && event["function"] == "raises"
+                && event["arity"] == 0
+                && event["class"] == "error"
+                && event["reason_repr"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("m5 fixture exception"))
+        }),
+        "sidecar should contain real exception_from metadata: {events:#?}"
+    );
+
+    let reader = open_mix_trace(&recorded.out_dir);
+    let event_jsons = (0..reader.event_count())
+        .map(|index| {
+            decode_reader_event_content(&reader.event_json(index).expect("read event json"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        event_jsons.iter().any(|event| {
+            event.contains("codetracer.elixir.exception_from.v1")
+                && event.contains("Elixir.CanonicalFlow")
+                && event.contains("m5 fixture exception")
+        }),
+        "reader should expose exception_from as Error event with schema metadata: {event_jsons:#?}"
+    );
+}
+
+#[test]
+fn e2e_runtime_call_trace_reader_roundtrip() {
+    let recorded = record_elixir_expression("m5-reader-roundtrip", "CanonicalFlow.identity(42)");
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let reader = open_mix_trace(&recorded.out_dir);
+    let function_names = reader_function_names(&reader);
+    assert!(
+        function_names
+            .iter()
+            .any(|name| name == "CanonicalFlow.identity/1"),
+        "reader should expose recorder-interned identity/1 function: {function_names:#?}"
+    );
+
+    let call_jsons = (0..reader.call_count())
+        .map(|key| reader.call_json(key).expect("read call json"))
+        .collect::<Vec<_>>();
+    let varnames = (0..reader.varname_count())
+        .map(|id| reader.varname(id).expect("read varname"))
+        .collect::<Vec<_>>();
+    assert!(
+        varnames.iter().any(|name| name == "_arg0")
+            && call_jsons.iter().any(|call| call.contains("42")),
+        "reader should expose generic _arg0 argument with real BEAM value 42: varnames={varnames:#?} calls={call_jsons:#?}"
+    );
+
+    assert_eq!(
+        raw_ctfs_call_return_values(&recorded.out_dir),
+        vec!["42"],
+        "raw CTFS calls.dat should contain the identity/1 return value"
     );
 }
 

@@ -105,6 +105,8 @@ dependencies = [
 name = "codetracer-elixir-recorder"
 version = "0.1.0"
 dependencies = [
+ "cbor4ii",
+ "codetracer_ctfs",
  "codetracer_trace_reader",
  "codetracer_trace_types",
  "codetracer_trace_writer",

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -7,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus};
 
 use codetracer_trace_reader::{create_trace_reader, TraceEventsFileFormat as ReaderFormat};
-use codetracer_trace_types::{EventLogKind, Line, TraceLowLevelEvent};
+use codetracer_trace_types::{
+    EventLogKind, FunctionId, Line, TraceLowLevelEvent, TypeId, TypeKind, ValueRecord,
+};
 use codetracer_trace_writer::trace_writer::TraceWriter as RustTraceWriter;
 use codetracer_trace_writer_nim::{
     NimTraceReaderHandle, NimTraceWriter, TraceEventsFileFormat as NimFormat,
@@ -462,6 +465,7 @@ impl RecordingSession {
         if runtime_result.delivered {
             self.writer.register_thread_start(runtime_result.thread_id);
             self.writer.register_thread_switch(runtime_result.thread_id);
+            self.write_runtime_trace_events(&runtime_result)?;
             self.writer.register_thread_exit(runtime_result.thread_id);
         }
         self.writer.register_special_event(
@@ -485,6 +489,88 @@ impl RecordingSession {
         write_trace_meta_json(self, &runtime_result, target_exit_code)
             .map_err(|error| RecorderDiagnostic::writer_finalization_failed(error.to_string()))
     }
+
+    fn write_runtime_trace_events(
+        &mut self,
+        runtime_result: &RuntimeDelivery,
+    ) -> Result<(), RecorderDiagnostic> {
+        let mut interner = FunctionInterner::new(&self.runtime.trace_functions);
+        let integer_type = self.writer.ensure_type_id(TypeKind::Int, "integer");
+        let raw_type = self.writer.ensure_type_id(TypeKind::Raw, "term");
+        let none_type = self.writer.ensure_type_id(TypeKind::None, "None");
+
+        for event in &runtime_result.trace_events {
+            match event {
+                RuntimeTraceEvent::Call {
+                    module,
+                    function,
+                    arity,
+                    args,
+                } => {
+                    let function_id = interner.ensure_id(
+                        &mut self.writer,
+                        module,
+                        function,
+                        *arity,
+                        &self.runtime.source_root,
+                    );
+                    let args = args
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            self.writer.arg(
+                                &format!("_arg{index}"),
+                                json_to_trace_value(value, integer_type, raw_type, none_type),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    self.writer.register_call(function_id, args);
+                }
+                RuntimeTraceEvent::Return {
+                    return_value: Some(value),
+                    ..
+                } => {
+                    self.writer.register_return(json_to_trace_value(
+                        value,
+                        integer_type,
+                        raw_type,
+                        none_type,
+                    ));
+                }
+                RuntimeTraceEvent::Return {
+                    return_value: None, ..
+                } => {
+                    self.writer
+                        .register_return(ValueRecord::None { type_id: none_type });
+                }
+                RuntimeTraceEvent::Exception {
+                    module,
+                    function,
+                    arity,
+                    class,
+                    reason,
+                    reason_repr,
+                } => {
+                    let payload = serde_json::json!({
+                        "schema": "codetracer.elixir.exception_from.v1",
+                        "module": module,
+                        "function": function,
+                        "arity": arity,
+                        "class": class,
+                        "reason": reason,
+                        "reason_repr": reason_repr,
+                    });
+                    self.writer.register_special_event(
+                        EventLogKind::Error,
+                        "exception_from",
+                        &payload.to_string(),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -495,6 +581,7 @@ struct RuntimeSession {
     source_root: PathBuf,
     source_paths: Vec<PathBuf>,
     copied_sources: Vec<CopiedSource>,
+    trace_functions: Vec<TraceFunctionSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -514,6 +601,7 @@ struct RuntimeDelivery {
     delivered: bool,
     thread_id: u64,
     root_pid: Option<String>,
+    trace_events: Vec<RuntimeTraceEvent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +609,45 @@ struct RuntimeSidecarEvent {
     event: String,
     thread_id: Option<u64>,
     root_pid: Option<String>,
+    module: Option<String>,
+    function: Option<String>,
+    arity: Option<u32>,
+    args: Option<Vec<serde_json::Value>>,
+    return_value: Option<serde_json::Value>,
+    class: Option<String>,
+    reason: Option<serde_json::Value>,
+    reason_repr: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TraceFunctionSpec {
+    module: String,
+    function: String,
+    arity: u32,
+    kind: String,
+    source_path: PathBuf,
+    line: i64,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeTraceEvent {
+    Call {
+        module: String,
+        function: String,
+        arity: u32,
+        args: Vec<serde_json::Value>,
+    },
+    Return {
+        return_value: Option<serde_json::Value>,
+    },
+    Exception {
+        module: String,
+        function: String,
+        arity: u32,
+        class: String,
+        reason: serde_json::Value,
+        reason_repr: String,
+    },
 }
 
 impl RuntimeSession {
@@ -537,6 +664,12 @@ impl RuntimeSession {
         };
         let source_paths = if mode == RuntimeMode::Beam {
             discover_source_paths(&source_root)
+                .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let trace_functions = if mode == RuntimeMode::Beam {
+            discover_trace_functions(&source_paths)
                 .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?
         } else {
             Vec::new()
@@ -565,6 +698,7 @@ impl RuntimeSession {
             source_root,
             source_paths,
             copied_sources,
+            trace_functions,
         })
     }
 
@@ -650,6 +784,7 @@ impl RuntimeSession {
                 delivered: false,
                 thread_id: RUNTIME_THREAD_ID,
                 root_pid: None,
+                trace_events: Vec::new(),
             });
         }
 
@@ -665,6 +800,7 @@ impl RuntimeSession {
         let mut delivered = false;
         let mut root_pid = None;
         let mut thread_id = RUNTIME_THREAD_ID;
+        let mut trace_events = Vec::new();
 
         for (line_number, line) in text.lines().enumerate() {
             let event: RuntimeSidecarEvent = serde_json::from_str(line).map_err(|error| {
@@ -688,6 +824,29 @@ impl RuntimeSession {
                     thread_id = event.thread_id.unwrap_or(thread_id);
                 }
                 "trace_delivered" => delivered = true,
+                "call" => {
+                    trace_events.push(RuntimeTraceEvent::Call {
+                        module: require_sidecar_string(&event, "module", line_number + 1)?,
+                        function: require_sidecar_string(&event, "function", line_number + 1)?,
+                        arity: require_sidecar_u32(&event, "arity", line_number + 1)?,
+                        args: event.args.unwrap_or_default(),
+                    });
+                }
+                "return_from" => {
+                    trace_events.push(RuntimeTraceEvent::Return {
+                        return_value: event.return_value,
+                    });
+                }
+                "exception_from" => {
+                    trace_events.push(RuntimeTraceEvent::Exception {
+                        module: require_sidecar_string(&event, "module", line_number + 1)?,
+                        function: require_sidecar_string(&event, "function", line_number + 1)?,
+                        arity: require_sidecar_u32(&event, "arity", line_number + 1)?,
+                        class: event.class.unwrap_or_else(|| "error".to_string()),
+                        reason: event.reason.unwrap_or(serde_json::Value::Null),
+                        reason_repr: event.reason_repr.unwrap_or_default(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -702,7 +861,164 @@ impl RuntimeSession {
             delivered,
             thread_id,
             root_pid,
+            trace_events,
         })
+    }
+}
+
+fn require_sidecar_string(
+    event: &RuntimeSidecarEvent,
+    field: &str,
+    line_number: usize,
+) -> Result<String, RecorderDiagnostic> {
+    let value = match field {
+        "module" => event.module.clone(),
+        "function" => event.function.clone(),
+        _ => None,
+    };
+    value.ok_or_else(|| {
+        RecorderDiagnostic::writer_finalization_failed(format!(
+            "runtime sidecar line {line_number} missing required field {field}"
+        ))
+    })
+}
+
+fn require_sidecar_u32(
+    event: &RuntimeSidecarEvent,
+    field: &str,
+    line_number: usize,
+) -> Result<u32, RecorderDiagnostic> {
+    let value = match field {
+        "arity" => event.arity,
+        _ => None,
+    };
+    value.ok_or_else(|| {
+        RecorderDiagnostic::writer_finalization_failed(format!(
+            "runtime sidecar line {line_number} missing required field {field}"
+        ))
+    })
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FunctionKey {
+    module: String,
+    function: String,
+    arity: u32,
+    kind: String,
+    defining_path: PathBuf,
+    defining_line: i64,
+}
+
+struct FunctionInterner {
+    specs: HashMap<(String, String, u32), TraceFunctionSpec>,
+    ids: HashMap<FunctionKey, FunctionId>,
+}
+
+impl FunctionInterner {
+    fn new(functions: &[TraceFunctionSpec]) -> Self {
+        let specs = functions
+            .iter()
+            .cloned()
+            .map(|function| {
+                (
+                    (
+                        function.module.clone(),
+                        function.function.clone(),
+                        function.arity,
+                    ),
+                    function,
+                )
+            })
+            .collect();
+        Self {
+            specs,
+            ids: HashMap::new(),
+        }
+    }
+
+    fn ensure_id(
+        &mut self,
+        writer: &mut NimTraceWriter,
+        module: &str,
+        function: &str,
+        arity: u32,
+        source_root: &Path,
+    ) -> FunctionId {
+        let spec = self
+            .specs
+            .get(&(module.to_string(), function.to_string(), arity))
+            .cloned()
+            .unwrap_or_else(|| TraceFunctionSpec {
+                module: module.to_string(),
+                function: function.to_string(),
+                arity,
+                kind: "beam".to_string(),
+                source_path: source_root.join("<unknown>"),
+                line: 1,
+            });
+        let key = FunctionKey {
+            module: spec.module.clone(),
+            function: spec.function.clone(),
+            arity: spec.arity,
+            kind: spec.kind.clone(),
+            defining_path: spec.source_path.clone(),
+            defining_line: spec.line,
+        };
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+
+        let display_name = function_display_name(&spec);
+        let id = writer.ensure_function_id(&display_name, &spec.source_path, Line(spec.line));
+        self.ids.insert(key, id);
+        id
+    }
+}
+
+fn function_display_name(function: &TraceFunctionSpec) -> String {
+    let module = if function.kind == "elixir" {
+        function
+            .module
+            .strip_prefix("Elixir.")
+            .unwrap_or(&function.module)
+            .to_string()
+    } else {
+        function.module.clone()
+    };
+    let separator = if function.kind == "erlang" { ":" } else { "." };
+    format!(
+        "{module}{separator}{name}/{arity}",
+        name = function.function,
+        arity = function.arity
+    )
+}
+
+fn json_to_trace_value(
+    value: &serde_json::Value,
+    integer_type: TypeId,
+    raw_type: TypeId,
+    none_type: TypeId,
+) -> ValueRecord {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .map(|i| ValueRecord::Int {
+                i,
+                type_id: integer_type,
+            })
+            .unwrap_or_else(|| ValueRecord::Raw {
+                r: number.to_string(),
+                type_id: raw_type,
+            }),
+        serde_json::Value::Null => ValueRecord::None { type_id: none_type },
+        serde_json::Value::String(text) => ValueRecord::Raw {
+            r: text.clone(),
+            type_id: raw_type,
+        },
+        other => ValueRecord::Raw {
+            r: other.to_string(),
+            type_id: raw_type,
+        },
     }
 }
 
@@ -808,6 +1124,161 @@ fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> 
     Ok(())
 }
 
+fn discover_trace_functions(source_paths: &[PathBuf]) -> io::Result<Vec<TraceFunctionSpec>> {
+    let mut functions = Vec::new();
+    for source_path in source_paths {
+        match source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some("ex" | "exs") => collect_elixir_trace_functions(source_path, &mut functions)?,
+            Some("erl") => collect_erlang_trace_functions(source_path, &mut functions)?,
+            _ => {}
+        }
+    }
+    functions.sort_by(|left, right| {
+        (
+            &left.module,
+            &left.function,
+            left.arity,
+            &left.source_path,
+            left.line,
+        )
+            .cmp(&(
+                &right.module,
+                &right.function,
+                right.arity,
+                &right.source_path,
+                right.line,
+            ))
+    });
+    functions.dedup_by(|left, right| {
+        left.module == right.module
+            && left.function == right.function
+            && left.arity == right.arity
+            && left.source_path == right.source_path
+            && left.line == right.line
+    });
+    Ok(functions)
+}
+
+fn collect_elixir_trace_functions(
+    source_path: &Path,
+    functions: &mut Vec<TraceFunctionSpec>,
+) -> io::Result<()> {
+    let text = fs::read_to_string(source_path)?;
+    let mut module = None;
+
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if module.is_none() {
+            if let Some(name) = trimmed.strip_prefix("defmodule ") {
+                module = Some(format!("Elixir.{}", take_identifier(name)));
+            }
+        }
+
+        for prefix in ["def ", "defp "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let Some(module) = &module else {
+                    continue;
+                };
+                let function = take_identifier(rest).trim_start_matches(':').to_string();
+                if function.is_empty() || function == "module" {
+                    continue;
+                }
+                functions.push(TraceFunctionSpec {
+                    module: module.clone(),
+                    function,
+                    arity: arity_from_elixir_def(rest),
+                    kind: "elixir".to_string(),
+                    source_path: source_path.to_path_buf(),
+                    line: (index + 1) as i64,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_erlang_trace_functions(
+    source_path: &Path,
+    functions: &mut Vec<TraceFunctionSpec>,
+) -> io::Result<()> {
+    let text = fs::read_to_string(source_path)?;
+    let mut module = None;
+
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("-module(") {
+            module = rest
+                .split_once(')')
+                .map(|(name, _)| name.trim().trim_matches('\'').to_string());
+            continue;
+        }
+        if trimmed.starts_with('%') || trimmed.starts_with('-') || !trimmed.contains("->") {
+            continue;
+        }
+        let Some((name, rest)) = trimmed.split_once('(') else {
+            continue;
+        };
+        let Some(module) = &module else {
+            continue;
+        };
+        let function = name.trim().trim_matches('\'').to_string();
+        if function.is_empty() || !is_erlang_function_name(&function) {
+            continue;
+        }
+        let Some((args, _)) = rest.split_once(')') else {
+            continue;
+        };
+        functions.push(TraceFunctionSpec {
+            module: module.clone(),
+            function,
+            arity: arity_from_args(args),
+            kind: "erlang".to_string(),
+            source_path: source_path.to_path_buf(),
+            line: (index + 1) as i64,
+        });
+    }
+
+    Ok(())
+}
+
+fn take_identifier(text: &str) -> String {
+    text.trim_start()
+        .chars()
+        .take_while(|ch| {
+            ch.is_alphanumeric() || *ch == '_' || *ch == '.' || *ch == ':' || *ch == '!'
+        })
+        .collect()
+}
+
+fn arity_from_elixir_def(text: &str) -> u32 {
+    let Some(after_name) = text.split_once('(').map(|(_, rest)| rest) else {
+        return 0;
+    };
+    let Some((args, _)) = after_name.split_once(')') else {
+        return 0;
+    };
+    arity_from_args(args)
+}
+
+fn arity_from_args(args: &str) -> u32 {
+    let args = args.trim();
+    if args.is_empty() {
+        0
+    } else {
+        args.split(',').count() as u32
+    }
+}
+
+fn is_erlang_function_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '\'')
+}
+
 fn is_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -861,17 +1332,19 @@ fn wrap_erlang_entrypoint(module: &str, function: &str, runtime: &RuntimeSession
 
 fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
-        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}]",
+        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:trace_functions, {trace_functions}}}]",
         session_file = elixir_charlist(&runtime.session_file.display().to_string()),
-        source_paths = elixir_charlist_list(&runtime.source_paths)
+        source_paths = elixir_charlist_list(&runtime.source_paths),
+        trace_functions = elixir_trace_function_list(&runtime.trace_functions)
     )
 }
 
 fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
     format!(
-        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}}]",
+        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{trace_functions,{trace_functions}}}]",
         session_file = erlang_string(&runtime.session_file.display().to_string()),
-        source_paths = erlang_string_list(&runtime.source_paths)
+        source_paths = erlang_string_list(&runtime.source_paths),
+        trace_functions = erlang_trace_function_list(&runtime.trace_functions)
     )
 }
 
@@ -891,8 +1364,55 @@ fn erlang_string_list(paths: &[PathBuf]) -> String {
     format!("[{}]", values.join(","))
 }
 
+fn elixir_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
+    let values = functions
+        .iter()
+        .map(|function| {
+            format!(
+                "{{{module}, {name}, {arity}, {kind}, {source_path}, {line}}}",
+                module = elixir_atom(&function.module),
+                name = elixir_atom(&function.function),
+                arity = function.arity,
+                kind = elixir_charlist(&function.kind),
+                source_path = elixir_charlist(&function.source_path.display().to_string()),
+                line = function.line
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
+}
+
+fn erlang_trace_function_list(functions: &[TraceFunctionSpec]) -> String {
+    let values = functions
+        .iter()
+        .map(|function| {
+            format!(
+                "{{{module},{name},{arity},{kind},{source_path},{line}}}",
+                module = erlang_atom(&function.module),
+                name = erlang_atom(&function.function),
+                arity = function.arity,
+                kind = erlang_string(&function.kind),
+                source_path = erlang_string(&function.source_path.display().to_string()),
+                line = function.line
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(","))
+}
+
 fn elixir_charlist(value: &str) -> String {
     format!("~c\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn elixir_atom(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        format!(":{value}")
+    } else {
+        format!(":\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 fn erlang_string(value: &str) -> String {
