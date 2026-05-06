@@ -26,7 +26,7 @@ test-goldens:
 test-integration:
   cargo run --locked -- --help >/dev/null
   cargo run --locked -- --version | grep -F "$(grep -E '^version = "' Cargo.toml | head -n1 | cut -d '"' -f2)"
-  set +e; cargo run --locked -- record --out-dir /tmp --format json -- sh -c 'exit 7'; status="$?"; set -e; test "$status" -eq 7
+  trace_dir="$(mktemp -d "${TMPDIR:-/tmp}/codetracer-elixir-recorder-cli.XXXXXX")"; set +e; cargo run --locked -- record --out-dir "$trace_dir" --format json -- sh -c 'exit 7'; status="$?"; set -e; rm -rf "$trace_dir"; test "$status" -eq 7
   elixir tests/integration/ctfs_writer_bridge_test.exs
 
 verify-trace-format-dependency:
