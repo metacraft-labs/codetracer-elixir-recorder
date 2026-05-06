@@ -1806,6 +1806,8 @@ impl RuntimeSession {
         build_dir: &Path,
     ) -> Result<Self, RecorderDiagnostic> {
         let build = read_standalone_build_summary(build_dir)?;
+        copy_standalone_metadata_artifacts(&build, &options.out_dir)
+            .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?;
         let copied_sources =
             copy_sources(&options.out_dir, &build.source_root, &build.source_paths)
                 .map_err(|error| RecorderDiagnostic::runtime_bootstrap_failed(error.to_string()))?;
@@ -2113,6 +2115,35 @@ impl RuntimeSession {
             trace_events,
         })
     }
+}
+
+fn copy_standalone_metadata_artifacts(
+    build: &StandaloneBuildSummary,
+    out_dir: &Path,
+) -> io::Result<()> {
+    for artifact in &build.manifests {
+        copy_trace_artifact(&build.build_dir, out_dir, &artifact.trace_copy_path)?;
+    }
+    for artifact in &build.source_maps {
+        copy_trace_artifact(&build.build_dir, out_dir, &artifact.trace_copy_path)?;
+    }
+    for artifact in &build.transformed_form_dumps {
+        copy_trace_artifact(&build.build_dir, out_dir, &artifact.trace_copy_path)?;
+    }
+    Ok(())
+}
+
+fn copy_trace_artifact(build_dir: &Path, out_dir: &Path, trace_copy_path: &str) -> io::Result<()> {
+    let source = build_dir.join(trace_copy_path);
+    if !source.is_file() {
+        return Ok(());
+    }
+    let destination = out_dir.join(trace_copy_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
 }
 
 fn require_optional_sidecar_string(
@@ -3882,9 +3913,21 @@ fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String 
         .as_ref()
         .map(|path| elixir_charlist(&path.display().to_string()))
         .unwrap_or_else(|| "~c\"\"".to_string());
+    let instrumented_path = runtime
+        .instrumented_ebin
+        .as_ref()
+        .map(|path| {
+            format!(
+                ":code.add_patha({})\n",
+                elixir_charlist(&path.display().to_string())
+            )
+        })
+        .unwrap_or_default();
     format!(
-        ":code.add_patha({runtime_ebin})\n:ok = :codetracer_erlang_runtime.start_session({options})\ntry do\n  {expression}\nafter\n  :ok = :codetracer_erlang_runtime.stop_session(:normal)\nend",
+        ":code.add_patha({runtime_ebin})\n{instrumented_path}{purge_modules}:ok = :codetracer_erlang_runtime.start_session({options})\ntry do\n  {expression}\nafter\n  :ok = :codetracer_erlang_runtime.stop_session(:normal)\nend",
         runtime_ebin = runtime_ebin,
+        instrumented_path = instrumented_path,
+        purge_modules = elixir_purge_trace_modules(&runtime.trace_functions),
         options = elixir_runtime_options(runtime)
     )
 }
@@ -3938,6 +3981,23 @@ fn elixir_charlist_list(paths: &[PathBuf]) -> String {
         .map(|path| elixir_charlist(&path.display().to_string()))
         .collect::<Vec<_>>();
     format!("[{}]", values.join(", "))
+}
+
+fn elixir_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
+    let modules = functions
+        .iter()
+        .map(|function| function.module.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    modules
+        .iter()
+        .map(|module| {
+            format!(
+                ":code.purge({module})\n:code.delete({module})\n",
+                module = elixir_atom(module)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn erlang_string_list(paths: &[PathBuf]) -> String {

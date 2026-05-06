@@ -1,6 +1,6 @@
 -module(codetracer_forms).
 
--export([instrument_file/4]).
+-export([instrument_file/4, instrument_abstract_forms/5]).
 
 instrument_file(SourcePath, OutDir, LocationsPath, DumpPath) ->
     try
@@ -8,6 +8,36 @@ instrument_file(SourcePath, OutDir, LocationsPath, DumpPath) ->
         ok = filelib:ensure_dir(LocationsPath),
         ok = filelib:ensure_dir(DumpPath),
         {ok, Forms0} = parse_forms(SourcePath),
+        Module = module_name(Forms0),
+        {Forms, Locations0, VariableSlots0} = instrument_forms(Forms0, Module, SourcePath),
+        Locations = dedup_locations(Locations0),
+        VariableSlots = dedup_variable_slots(VariableSlots0),
+        ok = write_locations(LocationsPath, Module, SourcePath, Locations, VariableSlots),
+        ok = write_forms_dump(DumpPath, Forms),
+        case compile:noenv_forms(Forms, [debug_info, return_errors, return_warnings, {outdir, OutDir}]) of
+            {ok, _Module} ->
+                ok;
+            {ok, _Module, _Warnings} ->
+                ok;
+            {ok, CompiledModule, Beam} when is_binary(Beam) ->
+                write_beam(OutDir, CompiledModule, Beam);
+            {ok, CompiledModule, Beam, _Warnings} when is_binary(Beam) ->
+                write_beam(OutDir, CompiledModule, Beam);
+            {error, Errors, Warnings} ->
+                {error, {compile_failed, Errors, Warnings}};
+            Other ->
+                {error, {compile_failed, Other}}
+        end
+    catch
+        Class:Reason:Stack ->
+            {error, {Class, Reason, Stack}}
+    end.
+
+instrument_abstract_forms(Forms0, SourcePath, OutDir, LocationsPath, DumpPath) when is_list(Forms0) ->
+    try
+        ok = filelib:ensure_dir(filename:join(OutDir, "dummy.beam")),
+        ok = filelib:ensure_dir(LocationsPath),
+        ok = filelib:ensure_dir(DumpPath),
         Module = module_name(Forms0),
         {Forms, Locations0, VariableSlots0} = instrument_forms(Forms0, Module, SourcePath),
         Locations = dedup_locations(Locations0),

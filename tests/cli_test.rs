@@ -61,6 +61,7 @@ fn assert_success(output: &Output, context: &str) {
 
 struct RecordedTrace {
     out_dir: PathBuf,
+    build_dir: Option<PathBuf>,
     output: Output,
 }
 
@@ -82,6 +83,25 @@ fn compile_elixir_fixture(fixture_dir: &Path, build_root: &Path) {
         .output()
         .expect("run mix compile");
     assert_success(&compile, "mix compile");
+}
+
+fn compile_mix_task_ebin(label: &str) -> PathBuf {
+    let tmp = temp_dir(label);
+    let ebin = tmp.join("codetracer-task-ebin");
+    fs::create_dir_all(&ebin).expect("create Mix task ebin");
+    let sources = [
+        repo_root().join("lib/codetracer_elixir_recorder/elixir_source_map.ex"),
+        repo_root().join("lib/mix/tasks/compile.codetracer.ex"),
+        repo_root().join("lib/mix/tasks/codetracer.record.ex"),
+    ];
+    let output = Command::new("elixirc")
+        .arg("-o")
+        .arg(&ebin)
+        .args(sources)
+        .output()
+        .expect("compile Codetracer Mix tasks");
+    assert_success(&output, "compile Codetracer Mix task ebin");
+    ebin
 }
 
 fn compile_erlang_fixture(ebin_dir: &Path) {
@@ -215,7 +235,11 @@ fn record_elixir_expression(label: &str, expression: &str) -> RecordedTrace {
         .output()
         .expect("run Elixir expression under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn record_elixir_fixture_expression(
@@ -248,7 +272,56 @@ fn record_elixir_fixture_expression(
         .output()
         .expect("run Elixir fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
+}
+
+fn record_mix_task_eval(
+    label: &str,
+    fixture_name: &str,
+    expression: &str,
+    extra_args: &[&str],
+) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let build_dir = tmp.join("codetracer-build");
+    let mix_build_root = tmp.join("mix-build");
+    let task_ebin = compile_mix_task_ebin(&format!("{label}-task"));
+    let fixture_dir = repo_root().join("test-programs/elixir").join(fixture_name);
+    let task_ebin_arg = format!("-pa {}", task_ebin.display());
+
+    let mut args = vec![
+        "codetracer.record",
+        "--build-dir",
+        build_dir.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--eval",
+        expression,
+    ];
+    args.extend_from_slice(extra_args);
+
+    let output = Command::new("mix")
+        .args(args)
+        .current_dir(&fixture_dir)
+        .env("MIX_ENV", "test")
+        .env("MIX_BUILD_ROOT", &mix_build_root)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .env("ERL_FLAGS", &task_ebin_arg)
+        .env("ELIXIR_ERL_OPTIONS", &task_ebin_arg)
+        .env("CODETRACER_ELIXIR_RECORDER_BIN", recorder_binary())
+        .env("CODETRACER_ELIXIR_RECORDER_ROOT", repo_root())
+        .output()
+        .expect("run mix codetracer.record");
+
+    RecordedTrace {
+        out_dir,
+        build_dir: Some(build_dir),
+        output,
+    }
 }
 
 fn record_erlang_canonical_function(label: &str, function: &str) -> RecordedTrace {
@@ -280,7 +353,11 @@ fn record_erlang_canonical_function(label: &str, function: &str) -> RecordedTrac
         .output()
         .expect("run Erlang canonical fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
@@ -312,7 +389,11 @@ fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
         .output()
         .expect("run Erlang spawn fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn record_erlang_tail_function(label: &str, function: &str) -> RecordedTrace {
@@ -344,7 +425,11 @@ fn record_erlang_tail_function(label: &str, function: &str) -> RecordedTrace {
         .output()
         .expect("run Erlang tail fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn record_erlang_branch_function(label: &str, function: &str) -> RecordedTrace {
@@ -376,7 +461,11 @@ fn record_erlang_branch_function(label: &str, function: &str) -> RecordedTrace {
         .output()
         .expect("run Erlang branch fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn record_erlang_value_matrix_function_with_env(
@@ -417,7 +506,11 @@ fn record_erlang_value_matrix_function_with_env(
         .output()
         .expect("run Erlang value_matrix fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn record_erlang_value_matrix_function(label: &str, function: &str) -> RecordedTrace {
@@ -453,7 +546,11 @@ fn record_erlang_generated_source_map_function(label: &str, function: &str) -> R
         .output()
         .expect("run generated source-map fixture under runtime session");
 
-    RecordedTrace { out_dir, output }
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
 }
 
 fn open_mix_trace(out_dir: &Path) -> NimTraceReaderHandle {
@@ -519,6 +616,36 @@ fn step_location_jsons(out_dir: &Path) -> Vec<Value> {
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
             serde_json::from_str(&text).expect("step locations JSON")
         })
+        .collect()
+}
+
+fn source_map_jsons(out_dir: &Path) -> Vec<Value> {
+    let root = out_dir.join("recorder_metadata/source_maps");
+    let mut paths = fs::read_dir(&root)
+        .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+        .map(|entry| entry.expect("source-map entry").path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            serde_json::from_str(&text).expect("source-map JSON")
+        })
+        .collect()
+}
+
+fn compiler_trace_events(recorded: &RecordedTrace) -> Vec<Value> {
+    let build_dir = recorded
+        .build_dir
+        .as_ref()
+        .expect("recorded Mix trace should retain codetracer build dir");
+    let path = build_dir.join("compiler_traces/events.jsonl");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("compiler trace JSON line"))
         .collect()
 }
 
@@ -1626,7 +1753,11 @@ fn e2e_source_location_resolution_real_files() {
             .env("TMPDIR", tmp.to_str().unwrap())
             .output()
             .expect("run Erlang fixture under runtime session");
-        RecordedTrace { out_dir, output }
+        RecordedTrace {
+            out_dir,
+            build_dir: None,
+            output,
+        }
     };
     assert_eq!(
         erlang.output.status.code(),
@@ -1736,6 +1867,231 @@ fn e2e_source_map_sparse_override_real_trace() {
             .iter()
             .any(|path| path.ends_with("lib/original_generated.ex")),
         "reader/raw CTFS-visible paths should include original source from source-map resolution: {paths:#?}"
+    );
+}
+
+#[test]
+fn e2e_mix_records_basic_elixir_app() {
+    let recorded =
+        record_mix_task_eval("m12-basic-mix", "basic_mix_app", "BasicMixApp.main()", &[]);
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("basic-ok:42"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let compiler_events = compiler_trace_events(&recorded);
+    assert!(
+        compiler_events.iter().any(|event| {
+            event["event"] == "on_module"
+                && event["env"]["file"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("lib/basic_mix_app.ex"))
+                && event["env"]["module"] == "Elixir.BasicMixApp"
+                && event["payload"]["bytecode_size"]
+                    .as_u64()
+                    .is_some_and(|size| size > 0)
+        }),
+        "real compiler tracer should record :on_module completion events: {compiler_events:#?}"
+    );
+    assert!(
+        compiler_events.iter().any(|event| {
+            let env = event["env"].as_object().expect("compiler trace env object");
+            event["event"] == "imported_function"
+                && env
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.ends_with("lib/basic_mix_app.ex"))
+                && env.get("line").and_then(Value::as_i64) == Some(4)
+                && env.get("module") == Some(&Value::String("Elixir.BasicMixApp".to_string()))
+                && env.get("function") == Some(&Value::String("compute/1".to_string()))
+                && env.contains_key("context")
+                && env.get("lexical_tracker").and_then(Value::as_str).is_some()
+        }),
+        "real compiler tracer should capture Macro.Env file/line/module/function/context/lexical tracker: {compiler_events:#?}"
+    );
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["trace_copy_path"] == "files/lib/basic_mix_app.ex"
+                    && source["build_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("lib/basic_mix_app.ex"))
+            })
+        }),
+        "trace metadata should list copied original Elixir source: {meta:#?}"
+    );
+    assert!(recorded
+        .out_dir
+        .join("files/lib/basic_mix_app.ex")
+        .is_file());
+    assert!(
+        recorded
+            .out_dir
+            .join("recorder_metadata/source_maps")
+            .is_dir(),
+        "trace bundle should contain real source-map artifacts"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.BasicMixApp")
+        .unwrap_or_else(|| panic!("missing BasicMixApp manifest: {manifests:#?}"));
+    assert!(
+        manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["resolution"] == "source_map"
+                    && location["trace_copy_path"] == "files/lib/basic_mix_app.ex"
+            })
+        }),
+        "Mix source locations should resolve to original .ex files: {manifest:#?}"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.BasicMixApp"
+                && event["function"] == "compute"
+                && event["source_location"]["resolution"] == "source_map"
+        }),
+        "runtime should record calls with source-map metadata: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "step"),
+        "instrumented Mix app should emit real step events: {events:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "mix.ct");
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("lib/basic_mix_app.ex")),
+        "CTFS reader should expose original Elixir paths: {paths:#?}"
+    );
+    assert!(
+        !raw_ctfs_call_return_values(&recorded.out_dir).is_empty(),
+        "raw CTFS calls.dat should contain real Mix call records"
+    );
+}
+
+#[test]
+fn e2e_mix_records_umbrella_project() {
+    let recorded = record_mix_task_eval(
+        "m12-umbrella",
+        "umbrella_app",
+        "UmbrellaCore.main()",
+        &["--include-app", "umbrella_core"],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("umbrella-core:42"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    assert!(
+        manifests
+            .iter()
+            .any(|manifest| manifest["module"]["name"] == "Elixir.UmbrellaCore"),
+        "selected umbrella app should produce manifests: {manifests:#?}"
+    );
+    assert!(
+        !manifests
+            .iter()
+            .any(|manifest| manifest["module"]["name"] == "Elixir.UmbrellaExtra"),
+        "unselected umbrella app should be filtered out: {manifests:#?}"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.UmbrellaCore"
+                && event["source_location"]["trace_copy_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("umbrella_core/lib/umbrella_core.ex"))
+        }),
+        "selected umbrella app should produce trace events: {events:#?}"
+    );
+}
+
+#[test]
+fn e2e_elixir_macro_source_mapping_real_trace() {
+    let recorded =
+        record_mix_task_eval("m12-macro", "macro_locations", "MacroLocations.main()", &[]);
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("macro-ok:42"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let source_maps = source_map_jsons(&recorded.out_dir);
+    assert!(
+        source_maps.iter().any(|map| {
+            map["source_language"] == "elixir"
+                && map["macro_expansion_chain_policy"]
+                    == "v1 records compiler-tracer macro event summaries but not full nested expansion chains"
+                && map["mappings"].as_array().is_some_and(|mappings| {
+                    mappings.iter().any(|mapping| {
+                        mapping["reason"] == "debug_info_erlang_v1"
+                            && mapping["original_line"].as_i64().is_some()
+                    })
+                })
+        }),
+        "real Mix source maps should record v1 macro-chain policy and sparse mappings: {source_maps:#?}"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.MacroLocations")
+        .unwrap_or_else(|| panic!("missing MacroLocations manifest: {manifests:#?}"));
+    assert!(
+        manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["resolution"] == "source_map"
+                    && location["trace_copy_path"] == "files/lib/macro_locations.ex"
+            }) && locations.iter().any(|location| {
+                location["resolution"] == "unknown_generated_fallback"
+            })
+        }),
+        "macro fixture should contain precise original mappings and generated fallbacks: {manifest:#?}"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.MacroLocations"
+                && event["function"] == "generated_answer"
+                && event["source_location"]["resolution"] == "source_map"
+        }),
+        "runtime should record macro-generated function calls with source mapping: {events:#?}"
     );
 }
 
