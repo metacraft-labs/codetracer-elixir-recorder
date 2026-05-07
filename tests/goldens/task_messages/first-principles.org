@@ -1,0 +1,100 @@
+#+TITLE: Task Messages First-Principles Golden Contract
+
+* Scope
+  This golden contract is hand-derived from the Elixir =task_messages= fixture
+  source =test-programs/elixir/task_messages/lib/task_messages.ex=. It is not
+  derived from recorder output.
+
+  DERIVATION: The fixture spawns a single =Task.async/1= worker, exchanges
+  three deterministic messages with it, and exits. The expected event counts
+  below follow directly from reading the source.
+
+* Expected Program Result
+  - expected stdout: =task-ok\n=
+  - expected exit code: =0=
+
+  DERIVATION: =TaskMessages.main/0= ends in =IO.puts("task-ok")= followed by
+  =:task_done=. Any failure in the message handshake would raise long before
+  =task-ok= is printed, so observing both stdout and a 0 exit is sufficient
+  evidence that the deterministic handshake completed.
+
+* Source Evidence
+  Source path: =test-programs/elixir/task_messages/lib/task_messages.ex=
+
+  #+begin_example
+  task_messages.ex:5   parent = self()
+  task_messages.ex:7   task = Task.async(fn ->
+  task_messages.ex:9     receive do
+  task_messages.ex:10      {:task_go, ^parent, 41} ->
+  task_messages.ex:11        send(parent, {:task_ready, self(), 42})
+  task_messages.ex:14    receive do
+  task_messages.ex:15      {:task_ack, ^parent} -> :task_done
+  task_messages.ex:20  send(task.pid, {:task_go, parent, 41})
+  task_messages.ex:22  receive do
+  task_messages.ex:23    {:task_ready, task_pid, 42} when task_pid == task.pid ->
+  task_messages.ex:24      send(task.pid, {:task_ack, parent})
+  task_messages.ex:27  :task_done = Task.await(task)
+  task_messages.ex:28  IO.puts("task-ok")
+  #+end_example
+
+* Process Topology
+  - Process P0: the main BEAM process running =TaskMessages.main/0=. The
+    runtime session assigns P0 the root CodeTracer thread id =1=.
+  - Process P1: the Task worker spawned by =Task.async/1=. The session
+    assigns P1 a stable session-local thread id (>=2) on first sight.
+
+  DERIVATION: =Task.async/1= spawns exactly one linked process for the
+  worker function. =Task.await/1= reads the worker's reply through the
+  linked monitor — it does not spawn additional user processes. Therefore
+  exactly one spawned thread is observed.
+
+* Expected Send/Receive Sequence
+  Each message is sent by exactly one process and received by exactly one
+  process, in this order:
+
+  1. =P0= sends ={:task_go, P0, 41}= to =P1= at =task_messages.ex:20=
+  2. =P1= receives ={:task_go, P0, 41}= at =task_messages.ex:9-10=
+  3. =P1= sends ={:task_ready, P1, 42}= to =P0= at =task_messages.ex:11=
+  4. =P0= receives ={:task_ready, P1, 42}= at =task_messages.ex:22-23=
+  5. =P0= sends ={:task_ack, P0}= to =P1= at =task_messages.ex:24=
+  6. =P1= receives ={:task_ack, P0}= at =task_messages.ex:14-15=
+
+  DERIVATION: The fixture uses =receive= clauses with literal pin matching
+  on =parent= and on the integers =41= / =42=, so message ordering is
+  enforced by message-pattern matching rather than scheduling.
+
+* Expected Trace Counts
+  - exit code: =0=
+  - sender/recipient pid stability: every send and its matching receive
+    must report the same =sender_pid= and =recipient_pid= text (BEAM PIDs
+    are session-stable strings).
+  - thread_start (CTFS step stream): >= 2 (root + Task worker)
+  - thread_exit (CTFS step stream): >= 2 (root + Task worker)
+  - thread_switch (CTFS step stream): >= 1 (root <-> Task worker boundary)
+  - process_spawn (sidecar JSONL): >= 1 (=Task.async/1= spawn)
+  - send sidecar lines (=message_send=): >= 3 (the three sends above)
+  - receive sidecar lines (=message_receive=): >= 3 (the three receives above)
+  - event_log_records (=codetracer.beam.message.v1=): >= 6
+    (one TraceLogEvent per send and per receive, with sender_pid,
+    recipient_pid, tag, and bounded =message_repr=)
+  - tags observed across the message stream: ={"task_go", "task_ready",
+    "task_ack"}=
+
+  DERIVATION: Each =send/2= produces exactly one =message_send= sidecar
+  record and one =TraceLogEvent= in CTFS. Each =receive= clause that fires
+  produces one =message_receive= sidecar record and one CTFS
+  =TraceLogEvent=. The fixture has exactly three =send= calls and three
+  =receive= matches, so the lower bounds above are tight.
+
+* Determinism
+  The fixture handshake is fully deterministic without =Process.sleep/1=:
+
+  - =P1=  blocks on =receive {:task_go, ^parent, 41}= until =P0= sends it,
+    so step (2) cannot occur before step (1).
+  - =P0=  blocks on =receive {:task_ready, task_pid, 42} when task_pid ==
+    task.pid= so step (4) cannot fire on a stale or out-of-order message.
+  - =P1=  blocks on =receive {:task_ack, ^parent}= so step (6) cannot fire
+    until =P0= acknowledges.
+
+  This means the first-principles event counts above are exact across
+  every successful run.

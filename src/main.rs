@@ -4616,6 +4616,38 @@ struct BundleSummary {
     sidecar_call_count: u64,
     sidecar_return_count: u64,
     sidecar_exception_from_count: u64,
+    /// Total number of CTFS step-stream `thread_start` markers across every
+    /// thread (root + spawned). M6 tests require >1 to confirm that spawned
+    /// BEAM processes are minted as CodeTracer threads via the reader.
+    thread_start_count: u64,
+    /// Total number of CTFS step-stream `thread_switch` markers across every
+    /// thread. M6 requires >=1 cross-process switch.
+    thread_switch_count: u64,
+    /// Total number of CTFS step-stream `thread_exit` markers across every
+    /// thread (root + spawned). M6 tests require >1 to confirm that exited
+    /// BEAM processes flushed a ThreadExit event.
+    thread_exit_count: u64,
+    /// Number of `process_spawn` runtime sidecar lines emitted by the
+    /// `procs` / `set_on_spawn` trace flags. M6 fixture tests assert this is
+    /// non-zero when child processes appear.
+    process_spawn_count: u64,
+    /// Number of `thread_exit` runtime sidecar lines whose origin is a
+    /// runtime `{trace, Pid, exit, _}` event (i.e. process exit, not the
+    /// shutdown barrier on the root). M6 tests require >=1.
+    process_exit_count: u64,
+    /// Number of `message_send` runtime sidecar lines (corresponding to
+    /// `{trace, Pid, send, ...}` events).
+    send_event_count: u64,
+    /// Number of `message_receive` runtime sidecar lines (corresponding to
+    /// `{trace, Pid, 'receive', ...}` events).
+    receive_event_count: u64,
+    /// Decoded structured send/receive payloads as recorded in the CTFS
+    /// trace's `TraceLogEvent` stream under the `codetracer.beam.message.v1`
+    /// schema. Surfaced through the same `NimTraceReaderHandle::event_json`
+    /// path the M5 exception verification uses, so the M6 integration tests
+    /// can assert on sender/recipient/payload contents read back through the
+    /// real reader.
+    event_log_records: Vec<MessageEventLogSummary>,
 }
 
 #[derive(Serialize, Debug)]
@@ -4625,6 +4657,19 @@ struct ExceptionFromSummary {
     function: String,
     arity: u32,
     class: String,
+}
+
+#[derive(Serialize, Debug)]
+struct MessageEventLogSummary {
+    schema: String,
+    direction: String,
+    tag: String,
+    sender: Option<String>,
+    recipient: Option<String>,
+    sender_thread_id: Option<u64>,
+    recipient_thread_id: Option<u64>,
+    payload_repr: String,
+    payload_truncated: bool,
 }
 
 fn read_bundle_summary_command(args: Vec<String>) -> Result<(), Box<dyn Error>> {
@@ -4664,14 +4709,25 @@ fn read_bundle_summary(
     let mut thread_start_count_root: u64 = 0;
     let mut thread_switch_count_root: u64 = 0;
     let mut thread_exit_count_root: u64 = 0;
+    let mut thread_start_count: u64 = 0;
+    let mut thread_switch_count: u64 = 0;
+    let mut thread_exit_count: u64 = 0;
     for index in 0..reader.step_count() {
         let step = reader.step_json(index)?;
-        if step.contains("\"thread_id\":1") {
-            if step.contains("\"kind\":\"thread_start\"") {
+        let is_root = step.contains("\"thread_id\":1");
+        if step.contains("\"kind\":\"thread_start\"") {
+            thread_start_count += 1;
+            if is_root {
                 thread_start_count_root += 1;
-            } else if step.contains("\"kind\":\"thread_switch\"") {
+            }
+        } else if step.contains("\"kind\":\"thread_switch\"") {
+            thread_switch_count += 1;
+            if is_root {
                 thread_switch_count_root += 1;
-            } else if step.contains("\"kind\":\"thread_exit\"") {
+            }
+        } else if step.contains("\"kind\":\"thread_exit\"") {
+            thread_exit_count += 1;
+            if is_root {
                 thread_exit_count_root += 1;
             }
         }
@@ -4737,13 +4793,30 @@ fn read_bundle_summary(
     let mut sidecar_call_count: u64 = 0;
     let mut sidecar_return_count: u64 = 0;
     let mut sidecar_exception_from_count: u64 = 0;
+    let mut process_spawn_count: u64 = 0;
+    let mut process_exit_count: u64 = 0;
+    let mut send_event_count: u64 = 0;
+    let mut receive_event_count: u64 = 0;
     for line in sidecar_text.lines() {
-        if line.contains("\"event\":\"call\"") {
-            sidecar_call_count += 1;
-        } else if line.contains("\"event\":\"return_from\"") {
-            sidecar_return_count += 1;
-        } else if line.contains("\"event\":\"exception_from\"") {
-            sidecar_exception_from_count += 1;
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let event = value.get("event").and_then(|value| value.as_str());
+        match event {
+            Some("call") => sidecar_call_count += 1,
+            Some("return_from") => sidecar_return_count += 1,
+            Some("exception_from") => sidecar_exception_from_count += 1,
+            Some("process_spawn") => process_spawn_count += 1,
+            Some("thread_exit") => {
+                let thread_id = value.get("thread_id").and_then(|value| value.as_u64());
+                if thread_id != Some(RUNTIME_THREAD_ID) {
+                    process_exit_count += 1;
+                }
+            }
+            Some("message_send") => send_event_count += 1,
+            Some("message_receive") => receive_event_count += 1,
+            _ => {}
         }
     }
 
@@ -4777,15 +4850,14 @@ fn read_bundle_summary(
 
     let mut exception_from_count: u64 = 0;
     let mut exception_from_records: Vec<ExceptionFromSummary> = Vec::new();
+    let mut event_log_records: Vec<MessageEventLogSummary> = Vec::new();
     for index in 0..reader.event_count() {
         let raw = reader.event_json(index)?;
         let event: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if event.get("kind").and_then(|value| value.as_str()) != Some("error") {
-            continue;
-        }
+        let kind = event.get("kind").and_then(|value| value.as_str());
         let bytes = event.get("data").and_then(|value| value.as_array());
         let Some(bytes) = bytes else {
             continue;
@@ -4804,33 +4876,72 @@ fn read_bundle_summary(
             .get("schema")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        if !schema.contains("exception_from") {
-            continue;
+
+        if kind == Some("error") && schema.contains("exception_from") {
+            exception_from_count += 1;
+            exception_from_records.push(ExceptionFromSummary {
+                schema: schema.to_string(),
+                module: payload
+                    .get("module")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                function: payload
+                    .get("function")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                arity: payload
+                    .get("arity")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as u32)
+                    .unwrap_or(0),
+                class: payload
+                    .get("class")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
         }
-        exception_from_count += 1;
-        exception_from_records.push(ExceptionFromSummary {
-            schema: schema.to_string(),
-            module: payload
-                .get("module")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            function: payload
-                .get("function")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            arity: payload
-                .get("arity")
-                .and_then(|value| value.as_u64())
-                .map(|value| value as u32)
-                .unwrap_or(0),
-            class: payload
-                .get("class")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        });
+
+        if schema == "codetracer.beam.message.v1" {
+            event_log_records.push(MessageEventLogSummary {
+                schema: schema.to_string(),
+                direction: payload
+                    .get("direction")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                tag: payload
+                    .get("tag")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                sender: payload
+                    .get("sender_pid")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+                recipient: payload
+                    .get("recipient_pid")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+                sender_thread_id: payload
+                    .get("sender_thread_id")
+                    .and_then(|value| value.as_u64()),
+                recipient_thread_id: payload
+                    .get("recipient_thread_id")
+                    .and_then(|value| value.as_u64()),
+                payload_repr: payload
+                    .get("message_repr")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                payload_truncated: payload
+                    .get("message_truncated")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            });
+        }
     }
 
     Ok(BundleSummary {
@@ -4866,6 +4977,14 @@ fn read_bundle_summary(
         sidecar_call_count,
         sidecar_return_count,
         sidecar_exception_from_count,
+        thread_start_count,
+        thread_switch_count,
+        thread_exit_count,
+        process_spawn_count,
+        process_exit_count,
+        send_event_count,
+        receive_event_count,
+        event_log_records,
     })
 }
 

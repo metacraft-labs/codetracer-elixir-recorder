@@ -1,0 +1,103 @@
+#+TITLE: Spawn Messages First-Principles Golden Contract
+
+* Scope
+  This golden contract is hand-derived from the Erlang =spawn_messages=
+  fixture source =test-programs/erlang/spawn_messages/src/spawn_messages.erl=.
+  It is not derived from recorder output.
+
+  DERIVATION: =spawn_messages:main/0= spawns one child process and exchanges
+  a deterministic handshake of three messages. =spawn_messages:flood/0=
+  spawns one child and exchanges =1 + Count + 1= deterministic messages
+  (Count = 64). The expected counts below follow directly from reading the
+  source.
+
+* main/0 Expected Program Result
+  - expected stdout: =spawn-ok\n=
+  - expected exit code: =0=
+
+  DERIVATION: =spawn_messages:main/0= ends with =io:format("spawn-ok~n")=
+  inside the =receive {spawn_pong, Child, 42} -> ...= clause; the only way
+  to reach that printout is for the deterministic handshake below to
+  complete successfully.
+
+* main/0 Source Evidence
+  Source path: =test-programs/erlang/spawn_messages/src/spawn_messages.erl=
+
+  #+begin_example
+  spawn_messages.erl:4   main() ->
+  spawn_messages.erl:5     Parent = self(),
+  spawn_messages.erl:6     Child = spawn(fun() -> child(Parent) end),
+  spawn_messages.erl:7     receive
+  spawn_messages.erl:8       {spawn_child_started, Child} -> ok
+  spawn_messages.erl:11    Child ! {spawn_ping, Parent, 41},
+  spawn_messages.erl:12    receive
+  spawn_messages.erl:13      {spawn_pong, Child, 42} -> io:format("spawn-ok~n")
+  spawn_messages.erl:18  child(Parent) ->
+  spawn_messages.erl:19    Parent ! {spawn_child_started, self()},
+  spawn_messages.erl:20    receive
+  spawn_messages.erl:21      {spawn_ping, Parent, 41} ->
+  spawn_messages.erl:22        Parent ! {spawn_pong, self(), 42}
+  #+end_example
+
+* main/0 Process Topology
+  - Process P0: the root Erlang process running =spawn_messages:main/0=.
+    The runtime session assigns it CodeTracer thread id =1=.
+  - Process P1: the child process spawned by =spawn(fun() -> child(Parent)
+    end)=. Session assigns it a stable thread id (>=2) on first sight.
+
+* main/0 Expected Send/Receive Sequence
+  1. =P1= sends ={spawn_child_started, P1}= to =P0= at line 19
+  2. =P0= receives ={spawn_child_started, P1}= at lines 7-8
+  3. =P0= sends ={spawn_ping, P0, 41}= to =P1= at line 11
+  4. =P1= receives ={spawn_ping, P0, 41}= at lines 20-21
+  5. =P1= sends ={spawn_pong, P1, 42}= to =P0= at line 22
+  6. =P0= receives ={spawn_pong, P1, 42}= at lines 12-13
+  7. =P1= terminates normally after the =receive=
+  8. =P0= terminates normally after the =receive=
+
+  DERIVATION: Every =receive= clause uses literal pattern variables bound
+  to the exact pids and integer constants, so out-of-order messages cannot
+  match.
+
+* main/0 Expected Trace Counts
+  - exit code: =0=
+  - thread_start (CTFS step stream): >= 2 (root + child)
+  - thread_exit (CTFS step stream): >= 2
+  - thread_switch (CTFS step stream): >= 1
+  - process_spawn (sidecar JSONL): >= 1 (the =spawn/1= call at line 6)
+  - send sidecar lines (=message_send=): >= 3 (the three sends)
+  - receive sidecar lines (=message_receive=): >= 3 (the three receives)
+  - event_log_records (=codetracer.beam.message.v1=): >= 6
+  - tags observed: ={"spawn_child_started", "spawn_ping", "spawn_pong"}=
+
+* flood/0 Expected Program Result
+  - expected stdout: =flush-ok\n=
+  - expected exit code: =0=
+  - flood child handshake count: =Count + 2 = 66= directed messages
+    (=flush_child_ready= + 64 =flush_ping= + =flush_done=)
+
+  DERIVATION: The flood fixture spawns one child and uses three message
+  classes:
+  1. The child sends =flush_child_ready= once before entering the loop.
+  2. The parent sends 64 =flush_ping= messages (=lists:foreach/2= with
+     =lists:seq(1, 64)=).
+  3. After consuming all =flush_ping= messages in order (the guard
+     =Index =:= Seen + 1= enforces sequential delivery), the child sends
+     =flush_done= once and exits.
+
+  The deterministic loop ensures send/receive pairs are bijective and
+  ordered, regardless of scheduler nondeterminism.
+
+* flood/0 Trace Counts
+  - send sidecar lines: >= 1 + 64 + 1 = 66
+  - receive sidecar lines: >= 66
+  - event_log_records: >= 132 (66 send + 66 receive)
+  - tags observed: ={"flush_child_ready", "flush_ping", "flush_done"}=
+  - sidecar must contain a single =trace_delivered= shutdown barrier line
+    with =delivery_target = "all"=.
+
+* Determinism
+  Both =main/0= and =flood/0= use ack-based handshakes — no
+  =timer:sleep/1=, no probabilistic timeouts. Each =receive= clause
+  matches a literal pid + integer or guarded sequence number, so the
+  observed event counts are exact across every successful run.
