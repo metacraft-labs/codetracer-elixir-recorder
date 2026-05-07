@@ -27,30 +27,6 @@ defmodule CodetracerBeamRecorder.CtfsWriterBridgeTest do
     assert_contains(summary, "diagnostic_event", "ctfs writer bridge fixture")
   end
 
-  test "e2e_json_diagnostic_writer_roundtrip" do
-    summary =
-      run_bridge!(
-        "json",
-        [
-          "writer-fixture",
-          "--format",
-          "json",
-          "--out-dir",
-          tmp_dir!("json")
-        ]
-      )
-
-    assert_field(summary, "status", "ok")
-    assert_field(summary, "format", "json")
-    assert_contains(summary, "writer", "NonStreamingTraceWriter")
-    assert_contains(summary, "reader", "JsonTraceReader")
-    assert_count_at_least(summary, "path_count", 1)
-    assert_count_at_least(summary, "step_count", 2)
-    assert_count_at_least(summary, "event_count", 1)
-    assert_contains(summary, "first_path", "canonical_flow.ex")
-    assert summary =~ "json writer bridge fixture"
-  end
-
   defp run_bridge!(label, bridge_args) do
     args = ["run", "--locked", "--quiet", "--"] ++ bridge_args
     {output, status} = System.cmd("cargo", args, cd: @repo_root, stderr_to_stdout: true)

@@ -5673,6 +5673,8 @@ fn e2e_cli_honors_env_vars_and_compile_instrument_aliases() {
                 "printf alias-target",
             ])
             .env("CODETRACER_BEAM_RECORDER_OUT_DIR", &env_out_dir)
+            // Per Recorder-CLI-Conventions.md §5 the recorder writes CTFS exclusively;
+            // CODETRACER_FORMAT must be silently ignored even when set to a foreign value.
             .env("CODETRACER_FORMAT", "json")
             .output()
             .unwrap_or_else(|error| panic!("run {subcommand} alias target: {error}"));
@@ -5692,7 +5694,10 @@ fn e2e_cli_honors_env_vars_and_compile_instrument_aliases() {
             .expect("read alias trace_meta.json");
         let trace_meta: Value = serde_json::from_str(&trace_meta_text).expect("alias trace meta");
         assert_eq!(trace_meta["subcommand"], subcommand);
-        assert_eq!(trace_meta["format"], "json");
+        assert_eq!(
+            trace_meta["format"], "ctfs",
+            "CODETRACER_FORMAT must not influence trace_meta format; recorder is CTFS-only"
+        );
         assert_eq!(trace_meta["target"]["exit_code"], 0);
     }
 }
@@ -6175,23 +6180,23 @@ fn e2e_cli_structured_errors() {
         "invalid_output_dir",
     );
 
-    assert_recorder_error(
-        clean_recorder_command()
-            .args([
-                "record",
-                "--out-dir",
-                tmp.join("invalid-format").to_str().unwrap(),
-                "--format",
-                "yaml",
-                "--",
-                "sh",
-                "-c",
-                "echo SHOULD_NOT_RUN",
-            ])
-            .output()
-            .expect("run invalid format scenario"),
-        "invalid_format",
-    );
+    // M4 sub-phase 2: per Recorder-CLI-Conventions.md §3 the recorder writes CTFS
+    // exclusively, so --format / -f must be rejected outright as an unknown flag.
+    let format_flag = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            tmp.join("rejects-format-flag").to_str().unwrap(),
+            "--format",
+            "json",
+            "--",
+            "sh",
+            "-c",
+            "echo SHOULD_NOT_RUN",
+        ])
+        .output()
+        .expect("run rejects-format-flag scenario");
+    assert_recorder_error(format_flag, "invalid_arguments");
 
     assert_recorder_error(
         clean_recorder_command()

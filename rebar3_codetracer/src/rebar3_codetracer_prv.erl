@@ -15,7 +15,6 @@ init(State) ->
         {example, "rebar3 as codetrace codetracer --out-dir ct-traces"},
         {opts, [
             {out_dir, $o, "out-dir", string, "Trace output directory"},
-            {format, $f, "format", string, "Trace format: ctfs, binary, json"},
             {build_dir, undefined, "build-dir", string, "Isolated recorder build directory"},
             {source_dir, undefined, "source-dir", string, "Additional source directory copied into the trace bundle"},
             {include_app, undefined, "include-app", string, "App name to include"},
@@ -44,13 +43,12 @@ do(State) ->
             _ ->
                 BuildDir = config_string(build_dir, Config, filename:join(["_build", "codetrace", "codetracer"])),
                 OutDir = config_string(out_dir, Config, "ct-traces"),
-                Format = config_string(format, Config, "ctfs"),
                 Recorder = recorder_binary(),
                 Mode = mode(Config),
                 ok = compile_profile(Mode, Config, BuildDir),
                 ok = run_recorder_compile(Recorder, BuildDir, SourceDirs, Config),
                 ok = maybe_rewrite_parse_transform_build(Mode, BuildDir, Apps),
-                ok = run_recorder_record(Recorder, BuildDir, OutDir, Format, Apps, Config),
+                ok = run_recorder_record(Recorder, BuildDir, OutDir, Apps, Config),
                 rebar_api:info("codetracer wrote trace to ~s using ~s mode", [OutDir, atom_to_list(Mode)]),
                 {ok, State}
         end
@@ -185,7 +183,7 @@ maybe_rewrite_parse_transform_build(parse_transform, BuildDir, Apps) ->
             ok
     end.
 
-run_recorder_record(Recorder, BuildDir, OutDir, Format, Apps, Config) ->
+run_recorder_record(Recorder, BuildDir, OutDir, Apps, Config) ->
     Profile = config_string(profile, Config, "codetrace"),
     RootMfa = config_string(root_mfa, Config, default_root_mfa(Apps)),
     Eval = config_string(eval, Config, eval_from_root_mfa(RootMfa)),
@@ -194,7 +192,6 @@ run_recorder_record(Recorder, BuildDir, OutDir, Format, Apps, Config) ->
     Args =
         ["record",
          "--out-dir", OutDir,
-         "--format", Format,
          "--build-dir", BuildDir,
          "--root-mfa", RootMfa,
          "--capture-messages", CaptureMessages,

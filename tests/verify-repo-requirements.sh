@@ -54,6 +54,17 @@ require_text() {
   fi
 }
 
+require_no_text() {
+  local path="$1"
+  local pattern="$2"
+  local description="$3"
+  if grep -Eq -- "$pattern" "$path"; then
+    fail "$description"
+  else
+    pass "$description"
+  fi
+}
+
 require_just_recipe() {
   local recipe="$1"
   if just --list --unsorted 2>/dev/null | awk '{print $1}' | sed 's/:$//' | grep -Fxq "$recipe"; then
@@ -134,10 +145,32 @@ require_json_sha codetracer-trace-format 5510db82cf7b937c74c84d12e1dced07585943f
 
 require_text src/main.rs 'codetracer-beam-recorder' "CLI binary identifies recorder name"
 require_text src/main.rs '--out-dir' "CLI help documents --out-dir"
-require_text src/main.rs '--format' "CLI help documents --format"
+require_no_text src/main.rs '"\s*-f, --format' "CLI source does NOT document --format flag"
+require_no_text src/main.rs 'CODETRACER_FORMAT\s+Trace' "CLI source does NOT document CODETRACER_FORMAT env var"
 require_text src/main.rs 'CODETRACER_BEAM_RECORDER_OUT_DIR' "CLI documents recorder out-dir environment variable"
-require_text src/main.rs 'CODETRACER_FORMAT' "CLI documents trace format environment variable"
 require_text src/main.rs 'CODETRACER_BEAM_RECORDER_DISABLED' "CLI handles disabled environment variable"
+
+help_output_file="$(mktemp -t codetracer-beam-recorder-help.XXXXXX)"
+trap 'rm -f "$help_output_file"' EXIT
+if cargo run --locked --quiet -- --help >"$help_output_file" 2>/dev/null; then
+  if grep -Fq -- '--format' "$help_output_file"; then
+    fail "CLI help does NOT document --format"
+  else
+    pass "CLI help does NOT document --format"
+  fi
+  if grep -Fq -- 'CODETRACER_FORMAT' "$help_output_file"; then
+    fail "CLI does NOT document CODETRACER_FORMAT env var"
+  else
+    pass "CLI does NOT document CODETRACER_FORMAT env var"
+  fi
+  if grep -Fq -- 'ct print' "$help_output_file"; then
+    pass "CLI help mentions \`ct print\` as the conversion tool"
+  else
+    fail "CLI help mentions \`ct print\` as the conversion tool"
+  fi
+else
+  fail "ran cargo run -- --help to inspect CLI help output"
+fi
 
 if [[ "$failures" -gt 0 ]]; then
   printf '\n%s compliance check(s) failed.\n' "$failures" >&2

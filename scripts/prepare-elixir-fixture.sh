@@ -172,7 +172,6 @@ printf 'Recording canonical Elixir fixture from %s\n' "$canonical_project"
     mix codetracer.record \
       --build-dir "$build_dir" \
       --out-dir "$output_dir" \
-      --format ctfs \
       --include-module Elixir.CanonicalFlow \
       --eval 'CanonicalFlow.main()'
 )

@@ -13,7 +13,6 @@ defmodule Mix.Tasks.Codetracer.Record do
       OptionParser.parse(recorder_args,
         strict: [
           out_dir: :string,
-          format: :string,
           build_dir: :string,
           eval: :string,
           include_app: :keep,
@@ -27,7 +26,7 @@ defmodule Mix.Tasks.Codetracer.Record do
           value_max_map_pairs: :integer,
           value_max_string_bytes: :integer
         ],
-        aliases: [o: :out_dir, f: :format, e: :eval]
+        aliases: [o: :out_dir, e: :eval]
       )
 
     if invalid != [] or rest != [] do
@@ -63,7 +62,6 @@ defmodule Mix.Tasks.Codetracer.Record do
 
     command =
       ["record", "--out-dir", out_dir, "--build-dir", build_dir] ++
-        option_pair("--format", opts[:format]) ++
         option_pair("--capture-messages", opts[:capture_messages]) ++
         integer_pair("--value-max-depth", opts[:value_max_depth]) ++
         integer_pair("--value-max-sequence-items", opts[:value_max_sequence_items]) ++
