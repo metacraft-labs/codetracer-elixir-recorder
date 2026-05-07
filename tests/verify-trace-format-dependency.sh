@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workspace_root="$(cd "$repo_root/.." && pwd)"
 trace_format_dir="$workspace_root/codetracer-trace-format"
-expected_sha="5510db82cf7b937c74c84d12e1dced07585943f5"
+expected_sha="cb2b67f120cb76a4d6db0b623ba37caf60ef96e4"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
