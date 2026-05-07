@@ -4648,6 +4648,51 @@ struct BundleSummary {
     /// can assert on sender/recipient/payload contents read back through the
     /// real reader.
     event_log_records: Vec<MessageEventLogSummary>,
+
+    /// M7: number of `*.manifest.json` files written under
+    /// `recorder_metadata/manifests/` that the recorder produced for the
+    /// recorded program. The runtime session also emits a `manifest_loaded`
+    /// sidecar event whose `manifest_count` must agree with this value.
+    manifest_count: u64,
+    /// M7: alphabetically sorted list of module names extracted from the
+    /// on-disk manifest files. Lets tests assert that the runtime saw the
+    /// modules it recorded without parsing JSON manually.
+    manifest_modules: Vec<String>,
+    /// M7: per-call manifest references taken from the runtime sidecar.
+    /// Each entry corresponds to a `call` event that resolved through a
+    /// loaded manifest, paired with its source-location `resolution`. The
+    /// list is in sidecar order so tests can verify the resolver order is
+    /// honored on a real, recorded program.
+    manifest_loaded_records: Vec<ManifestLoadedRecord>,
+    /// M7: snapshot of the `manifest_loaded` runtime sidecar event the
+    /// session emits at start. Captures the schema, encoding, and the
+    /// absolute manifest paths the runtime read from disk, so tests can
+    /// confirm the on-disk artifacts and the `persistent_term`-loaded set
+    /// match.
+    manifest_loaded_event: Option<ManifestLoadedEventSummary>,
+}
+
+#[derive(Serialize, Debug)]
+struct ManifestLoadedRecord {
+    event: String,
+    module: String,
+    function: String,
+    arity: u32,
+    manifest_id: String,
+    function_key: String,
+    location_id: u32,
+    clause_id: Option<u32>,
+    resolution: String,
+    trace_copy_path: String,
+}
+
+#[derive(Serialize, Debug)]
+struct ManifestLoadedEventSummary {
+    schema: String,
+    encoding: String,
+    persistent_term_key: String,
+    manifest_count: u64,
+    manifest_paths: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -4797,6 +4842,8 @@ fn read_bundle_summary(
     let mut process_exit_count: u64 = 0;
     let mut send_event_count: u64 = 0;
     let mut receive_event_count: u64 = 0;
+    let mut manifest_loaded_event: Option<ManifestLoadedEventSummary> = None;
+    let mut manifest_loaded_records: Vec<ManifestLoadedRecord> = Vec::new();
     for line in sidecar_text.lines() {
         let value: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -4804,7 +4851,65 @@ fn read_bundle_summary(
         };
         let event = value.get("event").and_then(|value| value.as_str());
         match event {
-            Some("call") => sidecar_call_count += 1,
+            Some("call") => {
+                sidecar_call_count += 1;
+                if let Some(manifest_id) = value
+                    .get("manifest_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                {
+                    let function_key = value
+                        .get("function_key")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let location_id = value
+                        .get("location_id")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value as u32)
+                        .unwrap_or(0);
+                    let clause_id = value
+                        .get("clause_id")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value as u32);
+                    let resolution = value
+                        .get("source_location")
+                        .and_then(|value| value.get("resolution"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let trace_copy_path = value
+                        .get("source_location")
+                        .and_then(|value| value.get("trace_copy_path"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    manifest_loaded_records.push(ManifestLoadedRecord {
+                        event: "call".to_string(),
+                        module: value
+                            .get("module")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        function: value
+                            .get("function")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        arity: value
+                            .get("arity")
+                            .and_then(|value| value.as_u64())
+                            .map(|value| value as u32)
+                            .unwrap_or(0),
+                        manifest_id: manifest_id.to_string(),
+                        function_key,
+                        location_id,
+                        clause_id,
+                        resolution,
+                        trace_copy_path,
+                    });
+                }
+            }
             Some("return_from") => sidecar_return_count += 1,
             Some("exception_from") => sidecar_exception_from_count += 1,
             Some("process_spawn") => process_spawn_count += 1,
@@ -4816,9 +4921,97 @@ fn read_bundle_summary(
             }
             Some("message_send") => send_event_count += 1,
             Some("message_receive") => receive_event_count += 1,
+            Some("manifest_loaded") => {
+                let schema = value
+                    .get("schema")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let encoding = value
+                    .get("encoding")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let persistent_term_key = value
+                    .get("persistent_term_key")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let manifest_count = value
+                    .get("manifest_count")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let manifest_paths = value
+                    .get("manifest_paths")
+                    .and_then(|value| value.as_array())
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(|path| path.as_str().map(|value| value.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                manifest_loaded_event = Some(ManifestLoadedEventSummary {
+                    schema,
+                    encoding,
+                    persistent_term_key,
+                    manifest_count,
+                    manifest_paths,
+                });
+            }
             _ => {}
         }
     }
+
+    // Discover manifests written to disk under recorder_metadata/manifests/.
+    // Tests use these to confirm the bundle layout matches the runtime view
+    // and that every recorded module produced a real on-disk JSON manifest.
+    let manifests_dir = bundle_dir.join("recorder_metadata").join("manifests");
+    let mut manifest_modules: Vec<String> = Vec::new();
+    let mut manifest_count: u64 = 0;
+    if manifests_dir.is_dir() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(&manifests_dir)
+            .map_err(|error| {
+                format!(
+                    "failed to read recorder_metadata/manifests at {}: {error}",
+                    manifests_dir.display()
+                )
+            })?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".manifest.json"))
+            })
+            .collect();
+        entries.sort();
+        manifest_count = entries.len() as u64;
+        for path in &entries {
+            let text = fs::read_to_string(path).map_err(|error| {
+                format!(
+                    "failed to read manifest artifact {}: {error}",
+                    path.display()
+                )
+            })?;
+            let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+                format!(
+                    "invalid manifest JSON {} (M7 v1 expects codetracer.beam.module-manifest.v1): {error}",
+                    path.display()
+                )
+            })?;
+            if let Some(name) = manifest
+                .get("module")
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+            {
+                manifest_modules.push(name.to_string());
+            }
+        }
+    }
+    manifest_modules.sort();
+    manifest_modules.dedup();
 
     let target_exit_code = trace_meta
         .get("target")
@@ -4985,6 +5178,10 @@ fn read_bundle_summary(
         send_event_count,
         receive_event_count,
         event_log_records,
+        manifest_count,
+        manifest_modules,
+        manifest_loaded_records,
+        manifest_loaded_event,
     })
 }
 
