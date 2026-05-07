@@ -158,4 +158,18 @@ defmodule ExceptionFlow do
     seen = Process.get(:exception_flow_after, [])
     length(Enum.filter(tags, &(&1 in seen)))
   end
+
+  # M5 verification entrypoint: deterministically raises an uncaught
+  # ArgumentError with a fixture-stable message. The recorder should produce
+  # an exception_from event for `crash_inner/0` (and one for `crash/0` too,
+  # because the exception unwinds both frames before BEAM exits the
+  # process). The driving target script asserts a non-zero exit so this
+  # function must never be wrapped in a rescue.
+  def crash do
+    crash_inner()
+  end
+
+  def crash_inner do
+    raise ArgumentError, message: "m5 fixture crash"
+  end
 end

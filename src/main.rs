@@ -4577,6 +4577,54 @@ struct BundleSummary {
     sources: Vec<String>,
     trace_meta_format: String,
     sidecar_trace_delivered: bool,
+    /// Total number of `FunctionRecord` entries in the CTFS function table,
+    /// queried through `NimTraceReaderHandle::function_count`. M5 verifies
+    /// recorder-owned function interning by reading these names back through
+    /// the real reader.
+    function_count: u64,
+    /// Display names of every function the recorder interned, in the order
+    /// `register_function` was called (i.e. first-sighting order).
+    function_names: Vec<String>,
+    /// Total number of completed `register_call` / `register_return` pairs,
+    /// queried through `NimTraceReaderHandle::call_count`. M5 expects this to
+    /// match the canonical-flow first-principles golden's call sequence
+    /// length when the canonical fixture runs to completion.
+    call_count: u64,
+    /// `function_id` for each call record, in call order. Combined with
+    /// `function_names` this lets the M5 tests assert on the exact recorded
+    /// call sequence.
+    call_function_ids: Vec<u64>,
+    /// Raw call JSON returned by `NimTraceReaderHandle::call_json` for each
+    /// call key. Lets the M5 reader-roundtrip test verify that calls,
+    /// returns, and arg lists round-trip through the trace.
+    call_json: Vec<String>,
+    /// Number of `EventLogKind::Error` special events whose decoded JSON
+    /// payload carries the BEAM `exception_from` schema. M5's exception
+    /// fixture verification asserts this is non-zero.
+    exception_from_count: u64,
+    /// Decoded MFA + class metadata for every recorded `exception_from`
+    /// event, so the integration test can assert on the fixture-specific
+    /// crash module and function.
+    exception_from_records: Vec<ExceptionFromSummary>,
+    /// `target.exit_code` field copied from `trace_meta.json` so tests can
+    /// verify the recorder did not swallow the target program's exit code
+    /// when an exception unwound the BEAM process.
+    target_exit_code: i32,
+    /// Counts of `call` / `return_from` / `exception_from` lines in the
+    /// runtime session sidecar, enabling tests to detect lifecycle drift
+    /// before the events even reach the writer.
+    sidecar_call_count: u64,
+    sidecar_return_count: u64,
+    sidecar_exception_from_count: u64,
+}
+
+#[derive(Serialize, Debug)]
+struct ExceptionFromSummary {
+    schema: String,
+    module: String,
+    function: String,
+    arity: u32,
+    class: String,
 }
 
 fn read_bundle_summary_command(args: Vec<String>) -> Result<(), Box<dyn Error>> {
@@ -4684,10 +4732,106 @@ fn read_bundle_summary(
         .unwrap_or_default();
 
     let sidecar_path = bundle_dir.join("runtime_session.jsonl");
-    let sidecar_trace_delivered = match fs::read_to_string(&sidecar_path) {
-        Ok(text) => text.contains("\"event\":\"trace_delivered\""),
-        Err(_) => false,
-    };
+    let sidecar_text = fs::read_to_string(&sidecar_path).unwrap_or_default();
+    let sidecar_trace_delivered = sidecar_text.contains("\"event\":\"trace_delivered\"");
+    let mut sidecar_call_count: u64 = 0;
+    let mut sidecar_return_count: u64 = 0;
+    let mut sidecar_exception_from_count: u64 = 0;
+    for line in sidecar_text.lines() {
+        if line.contains("\"event\":\"call\"") {
+            sidecar_call_count += 1;
+        } else if line.contains("\"event\":\"return_from\"") {
+            sidecar_return_count += 1;
+        } else if line.contains("\"event\":\"exception_from\"") {
+            sidecar_exception_from_count += 1;
+        }
+    }
+
+    let target_exit_code = trace_meta
+        .get("target")
+        .and_then(|value| value.get("exit_code"))
+        .and_then(|value| value.as_i64())
+        .map(|value| value as i32)
+        .unwrap_or(0);
+
+    let function_count = reader.function_count();
+    let mut function_names = Vec::with_capacity(function_count as usize);
+    for index in 0..function_count {
+        function_names.push(reader.function(index)?);
+    }
+
+    let call_count = reader.call_count();
+    let mut call_function_ids = Vec::with_capacity(call_count as usize);
+    let mut call_json_records = Vec::with_capacity(call_count as usize);
+    for index in 0..call_count {
+        let raw = reader.call_json(index)?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|error| format!("invalid call_json: {error}"))?;
+        let function_id = parsed
+            .get("function_id")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| "call record missing function_id".to_string())?;
+        call_function_ids.push(function_id);
+        call_json_records.push(raw);
+    }
+
+    let mut exception_from_count: u64 = 0;
+    let mut exception_from_records: Vec<ExceptionFromSummary> = Vec::new();
+    for index in 0..reader.event_count() {
+        let raw = reader.event_json(index)?;
+        let event: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if event.get("kind").and_then(|value| value.as_str()) != Some("error") {
+            continue;
+        }
+        let bytes = event.get("data").and_then(|value| value.as_array());
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let bytes = bytes
+            .iter()
+            .filter_map(|value| value.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+            .collect::<Vec<u8>>();
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let schema = payload
+            .get("schema")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if !schema.contains("exception_from") {
+            continue;
+        }
+        exception_from_count += 1;
+        exception_from_records.push(ExceptionFromSummary {
+            schema: schema.to_string(),
+            module: payload
+                .get("module")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            function: payload
+                .get("function")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            arity: payload
+                .get("arity")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32)
+                .unwrap_or(0),
+            class: payload
+                .get("class")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
 
     Ok(BundleSummary {
         status: "ok",
@@ -4711,6 +4855,17 @@ fn read_bundle_summary(
         sources,
         trace_meta_format,
         sidecar_trace_delivered,
+        function_count,
+        function_names,
+        call_count,
+        call_function_ids,
+        call_json: call_json_records,
+        exception_from_count,
+        exception_from_records,
+        target_exit_code,
+        sidecar_call_count,
+        sidecar_return_count,
+        sidecar_exception_from_count,
     })
 }
 
