@@ -3222,6 +3222,297 @@ fn e2e_elixir_values_comprehensions_matrix() {
 }
 
 #[test]
+fn e2e_elixir_protocol_macro_behaviour_matrix() {
+    let recorded = record_mix_task_eval(
+        "m15-elixir-protocol-macro-behaviour",
+        "protocol_macro_behaviour",
+        "ProtocolMacroBehaviour.main()",
+        &[],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout)
+            .contains("protocol-macro-behaviour-ok:549"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    for (module, function, arity, path) in [
+        (
+            "Elixir.ProtocolMacroBehaviour",
+            "main",
+            0,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour",
+            "protocol_matrix",
+            0,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour",
+            "macro_matrix",
+            1,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour",
+            "behaviour_matrix",
+            1,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour.UsingWorker",
+            "perform",
+            1,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour.UsingWorker",
+            "overridable_score",
+            1,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour.UsingWorker",
+            "macro_generated_score",
+            1,
+            "files/lib/protocol_macro_behaviour.ex",
+        ),
+        (
+            "Elixir.ProtocolMacroBehaviour.Imported",
+            "imported_bonus",
+            1,
+            "files/lib/protocol_macro_behaviour/macros.ex",
+        ),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "call"
+                    && event["module"] == module
+                    && event["function"] == function
+                    && event["arity"] == arity
+                    && event["source_location"]["trace_copy_path"] == path
+                    && event["source_location"]["resolution"] == "source_map"
+            }),
+            "runtime sidecar should include {module}.{function}/{arity} with source-map metadata: {events:#?}"
+        );
+    }
+
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.ProtocolMacroBehaviour.Renderable"
+                && event["function"] == "score"
+                && event["arity"] == 1
+        }),
+        "runtime sidecar should include defprotocol dispatch calls: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"].as_str().is_some_and(|module| {
+                    module.contains("Renderable.ProtocolMacroBehaviour.ManualItem")
+                })
+                && event["function"] == "score"
+                && event["arity"] == 1
+        }),
+        "runtime sidecar should include the explicit defimpl path: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"].as_str().is_some_and(|module| {
+                    module.contains("Renderable.ProtocolMacroBehaviour.DerivedItem")
+                        || module == "Elixir.ProtocolMacroBehaviour.Renderable.Any"
+                })
+                && event["function"] == "score"
+                && event["arity"] == 1
+        }),
+        "runtime sidecar should include the @derive protocol implementation path: {events:#?}"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("protocol_score", 199),
+        ("macro_score", 220),
+        ("behaviour_score", 75),
+        ("attribute_score", 55),
+        ("manual_score", 15),
+        ("derived_score", 33),
+        ("label_size", 55),
+        ("hygiene_score", 125),
+        ("generated_score", 24),
+        ("bound_from_macro", 65),
+        ("perform_score", 43),
+        ("super_score", 17),
+        ("imported_score", 15),
+        ("attr_protocol_score", 48),
+        ("final_total", 549),
+    ] {
+        assert_sidecar_elixir_binding(&binds, name, value);
+    }
+
+    let meta = trace_meta(&recorded.out_dir);
+    for path in [
+        "files/lib/protocol_macro_behaviour.ex",
+        "files/lib/protocol_macro_behaviour/macros.ex",
+    ] {
+        assert!(
+            meta["sources"].as_array().is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| source["trace_copy_path"] == path)
+            }),
+            "trace metadata should expose fixture source {path}: {meta:#?}"
+        );
+        assert!(
+            recorded.out_dir.join(path).is_file(),
+            "trace bundle should copy {path}"
+        );
+    }
+
+    let source_maps = source_map_jsons(&recorded.out_dir);
+    for path in [
+        "lib/protocol_macro_behaviour.ex",
+        "lib/protocol_macro_behaviour/macros.ex",
+    ] {
+        assert!(
+            source_maps.iter().any(|map| {
+                map["source_language"] == "elixir"
+                    && map["original_path"]
+                        .as_str()
+                        .is_some_and(|original| original.ends_with(path))
+                    && map["mappings"]
+                        .as_array()
+                        .is_some_and(|mappings| !mappings.is_empty())
+            }),
+            "source-map artifacts should include {path}: {source_maps:#?}"
+        );
+    }
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let main_manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.ProtocolMacroBehaviour")
+        .unwrap_or_else(|| panic!("missing ProtocolMacroBehaviour manifest: {manifests:#?}"));
+    assert!(
+        main_manifest["functions"]
+            .as_array()
+            .is_some_and(|functions| {
+                [
+                    "Elixir.ProtocolMacroBehaviour.main/0",
+                    "Elixir.ProtocolMacroBehaviour.protocol_matrix/0",
+                    "Elixir.ProtocolMacroBehaviour.macro_matrix/1",
+                    "Elixir.ProtocolMacroBehaviour.behaviour_matrix/1",
+                    "Elixir.ProtocolMacroBehaviour.attribute_matrix/0",
+                ]
+                .into_iter()
+                .all(|key| functions.iter().any(|function| function["key"] == key))
+            })
+            && main_manifest["locations"]
+                .as_array()
+                .is_some_and(|locations| {
+                    locations.iter().any(|location| {
+                        location["trace_copy_path"] == "files/lib/protocol_macro_behaviour.ex"
+                            && location["resolution"] == "source_map"
+                    })
+                }),
+        "ProtocolMacroBehaviour manifest should expose source-mapped functions: {main_manifest:#?}"
+    );
+    let worker_manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.ProtocolMacroBehaviour.UsingWorker")
+        .unwrap_or_else(|| panic!("missing UsingWorker manifest: {manifests:#?}"));
+    assert!(
+        worker_manifest["functions"].as_array().is_some_and(|functions| {
+            [
+                "Elixir.ProtocolMacroBehaviour.UsingWorker.perform/1",
+                "Elixir.ProtocolMacroBehaviour.UsingWorker.overridable_score/1",
+                "Elixir.ProtocolMacroBehaviour.UsingWorker.macro_generated_score/1",
+            ]
+            .into_iter()
+            .all(|key| functions.iter().any(|function| function["key"] == key))
+        }) && worker_manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["trace_copy_path"] == "files/lib/protocol_macro_behaviour.ex"
+                    && location["resolution"] == "source_map"
+            })
+        }),
+        "UsingWorker manifest should expose behaviour, super, and macro-generated functions: {worker_manifest:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "mix.ct");
+    assert!(
+        reader.step_count() > 0,
+        "CTFS reader should expose protocol/macro/behaviour steps"
+    );
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    for path in [
+        "lib/protocol_macro_behaviour.ex",
+        "lib/protocol_macro_behaviour/macros.ex",
+    ] {
+        assert!(
+            paths.iter().any(|observed| observed.ends_with(path)),
+            "CTFS reader paths should include {path}: {paths:#?}"
+        );
+    }
+    let function_names = reader_function_names(&reader);
+    for expected in [
+        "ProtocolMacroBehaviour.main/0",
+        "ProtocolMacroBehaviour.protocol_matrix/0",
+        "ProtocolMacroBehaviour.macro_matrix/1",
+        "ProtocolMacroBehaviour.behaviour_matrix/1",
+        "ProtocolMacroBehaviour.UsingWorker.perform/1",
+        "ProtocolMacroBehaviour.UsingWorker.macro_generated_score/1",
+        "ProtocolMacroBehaviour.Imported.imported_bonus/1",
+    ] {
+        assert!(
+            function_names.iter().any(|name| name == expected),
+            "CTFS reader should expose {expected}: {function_names:#?}"
+        );
+    }
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "ProtocolMacroBehaviour.UsingWorker.perform/1")
+            && call_names.iter().any(|name| {
+                name == "ProtocolMacroBehaviour.UsingWorker.macro_generated_score/1"
+            })
+            && call_names
+                .iter()
+                .any(|name| name == "ProtocolMacroBehaviour.Imported.imported_bonus/1"),
+        "CTFS reader should expose protocol/macro/behaviour call records: {call_names:#?}"
+    );
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "mix.ct");
+    for (name, value) in [
+        ("protocol_score", 199),
+        ("macro_score", 220),
+        ("behaviour_score", 75),
+        ("attribute_score", 55),
+        ("final_total", 549),
+    ] {
+        assert_reader_elixir_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "mix.ct");
+    assert_raw_elixir_value(&values, "final_total", "final integer total", |value| {
+        matches!(value, ValueRecord::Int { i: 549, .. })
+    });
+}
+
+#[test]
 fn e2e_mix_records_umbrella_project() {
     let recorded = record_mix_task_eval(
         "m12-umbrella",
