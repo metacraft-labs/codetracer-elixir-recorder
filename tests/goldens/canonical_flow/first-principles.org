@@ -125,3 +125,43 @@
   or message-send expression. Mix, erl, logger, code server, and other runtime
   infrastructure may exist while the real toolchains run, but those are not
   fixture-owned process relationships.
+
+* Expected Step Sequence (M8 instrumentation oracle)
+  M8 step instrumentation emits =codetracer_erlang_runtime:step(LocationId)=
+  exactly once per source-level executable expression — i.e. per source line
+  whose logical source location differs from the previous step. The oracle is
+  the order in which control flow reaches each line of the fixture source:
+  =compute/0= is entered first because the Erlang =-s canonical_flow main=
+  entrypoint calls =main/0=, which calls =compute/0= as its first body
+  expression.
+
+  DERIVATION: Each row below is justified by the per-line expression in the
+  source. Branch / try / receive entries do not appear in this fixture; the
+  fixture is straight-line code in two functions. The expected count of step
+  events is the number of distinct executable source lines reached during a
+  successful run.
+
+** Erlang
+   The fixture entrypoint is =canonical_flow:main/0= (=-s canonical_flow main=).
+   The recorded step events reach the runtime in this order:
+
+   | order | function   | source line | expected source expression       |
+   |-------+------------+-------------+----------------------------------|
+   |     1 | =main/0=    |          14 | =Result = compute()=             |
+   |     2 | =compute/0= |           5 | =A = 10=                         |
+   |     3 | =compute/0= |           6 | =B = 32=                         |
+   |     4 | =compute/0= |           7 | =SumVal = A + B=                 |
+   |     5 | =compute/0= |           8 | =Doubled = SumVal * 2=           |
+   |     6 | =compute/0= |           9 | =FinalResult = Doubled + A=      |
+   |     7 | =compute/0= |          10 | =true = FinalResult =:= 94=      |
+   |     8 | =compute/0= |          11 | =FinalResult.= (tail return)     |
+   |     9 | =main/0=    |          15 | =true = Result =:= 94=           |
+   |    10 | =main/0=    |          16 | =io:format("~p~n", [Result])=    |
+   |    11 | =main/0=    |          17 | =Result.= (tail return)          |
+
+   The expected total step count is *11* — one per distinct source-line
+   expression executed in =main/0= and =compute/0=. Anything more than 11 (for
+   example, two steps on a single line because the instrumentation walked AST
+   nodes rather than source lines) breaks the per-source-line granularity
+   contract. Anything fewer breaks the "step before every executable
+   expression" contract.
