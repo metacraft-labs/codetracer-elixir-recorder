@@ -8,7 +8,7 @@ build-native:
   cd rebar3_codetracer && rebar3 compile
 
 test:
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration; fi
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v elixir >/dev/null 2>&1 || ! command -v mix >/dev/null 2>&1 || ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1 || ! command -v rebar3 >/dev/null 2>&1; then nix develop --command just test; else just test-rust && just test-goldens && just test-elixir && just test-erlang && just verify-trace-format-dependency && just test-integration && just verify-elixir-fixture-generation-no-silent-skip; fi
 
 t: test
 
@@ -33,6 +33,9 @@ test-integration:
 verify-trace-format-dependency:
   bash tests/verify-trace-format-dependency.sh
 
+verify-elixir-fixture-generation-no-silent-skip:
+  bash tests/verify-elixir-fixture-generation-no-silent-skip.sh
+
 lint:
   if ! command -v cargo >/dev/null 2>&1 || ! command -v nixfmt >/dev/null 2>&1 || ! command -v shellcheck >/dev/null 2>&1; then nix develop --command just lint; else just lint-nix && just lint-rust && just lint-shell && just verify-repo-requirements && just verify-trace-format-dependency; fi
 
@@ -44,7 +47,7 @@ lint-rust:
   cargo clippy --locked --all-targets -- -D warnings
 
 lint-shell:
-  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/fixtures/*.sh
+  shellcheck tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 verify-repo-requirements:
   bash tests/verify-repo-requirements.sh
@@ -61,7 +64,7 @@ format-rust:
   cargo fmt
 
 format-shell:
-  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/fixtures/*.sh
+  shfmt -w tests/verify-repo-requirements.sh tests/verify-golden-contract.sh tests/verify-trace-format-dependency.sh tests/verify-elixir-fixture-generation-no-silent-skip.sh tests/fixtures/*.sh scripts/*.sh
 
 test-integration-fixture:
   just test-integration
