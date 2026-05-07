@@ -5443,6 +5443,27 @@ fn assert_runtime_session_trace(
     expected_injection_text: &str,
     expected_source: &str,
 ) {
+    let expected_language = if ct_file_name.starts_with("erl") {
+        "erlang"
+    } else {
+        "elixir"
+    };
+    assert_runtime_session_trace_with_language(
+        out_dir,
+        ct_file_name,
+        expected_injection_text,
+        expected_source,
+        expected_language,
+    );
+}
+
+fn assert_runtime_session_trace_with_language(
+    out_dir: &Path,
+    ct_file_name: &str,
+    expected_injection_text: &str,
+    expected_source: &str,
+    expected_language: &str,
+) {
     let ct_path = out_dir.join(ct_file_name);
     assert!(
         ct_path.is_file(),
@@ -5455,26 +5476,35 @@ fn assert_runtime_session_trace(
     let step_jsons = (0..reader.step_count())
         .map(|index| reader.step_json(index).expect("read step json"))
         .collect::<Vec<_>>();
-    assert!(
-        step_jsons
-            .iter()
-            .any(|json| json.contains("\"kind\":\"thread_start\"")
-                && json.contains("\"thread_id\":1")),
-        "missing root ThreadStart in {step_jsons:#?}"
+    let thread_start_count = step_jsons
+        .iter()
+        .filter(|json| {
+            json.contains("\"kind\":\"thread_start\"") && json.contains("\"thread_id\":1")
+        })
+        .count();
+    assert_eq!(
+        thread_start_count, 1,
+        "expected exactly one root ThreadStart, got {thread_start_count}: {step_jsons:#?}"
     );
+    let thread_switch_count = step_jsons
+        .iter()
+        .filter(|json| {
+            json.contains("\"kind\":\"thread_switch\"") && json.contains("\"thread_id\":1")
+        })
+        .count();
     assert!(
-        step_jsons
-            .iter()
-            .any(|json| json.contains("\"kind\":\"thread_switch\"")
-                && json.contains("\"thread_id\":1")),
-        "missing initial root ThreadSwitch in {step_jsons:#?}"
+        thread_switch_count >= 1,
+        "expected at least one root ThreadSwitch, got {thread_switch_count}: {step_jsons:#?}"
     );
-    assert!(
-        step_jsons
-            .iter()
-            .any(|json| json.contains("\"kind\":\"thread_exit\"")
-                && json.contains("\"thread_id\":1")),
-        "missing root ThreadExit in {step_jsons:#?}"
+    let thread_exit_count = step_jsons
+        .iter()
+        .filter(|json| {
+            json.contains("\"kind\":\"thread_exit\"") && json.contains("\"thread_id\":1")
+        })
+        .count();
+    assert_eq!(
+        thread_exit_count, 1,
+        "expected exactly one root ThreadExit, got {thread_exit_count}: {step_jsons:#?}"
     );
 
     let copied_source = out_dir.join("source_map").join(expected_source);
@@ -5488,6 +5518,11 @@ fn assert_runtime_session_trace(
     let trace_meta_text = fs::read_to_string(&trace_meta_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", trace_meta_path.display()));
     let trace_meta: Value = serde_json::from_str(&trace_meta_text).expect("trace_meta.json");
+    assert_eq!(trace_meta["format"], "ctfs");
+    assert_eq!(
+        trace_meta["language"], expected_language,
+        "trace_meta.json language must match the BEAM source language for the recorded process"
+    );
     assert_eq!(trace_meta["runtime_session"]["mode"], "beam");
     assert_eq!(trace_meta["runtime_session"]["delivered"], true);
     assert_eq!(trace_meta["runtime_session"]["root_thread_id"], 1);

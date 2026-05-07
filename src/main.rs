@@ -52,6 +52,8 @@ fn run() -> Result<i32, RecorderDiagnostic> {
         "writer-fixture" => write_fixture(args)
             .map(|_| ())
             .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?,
+        "read-bundle-summary" => read_bundle_summary_command(args)
+            .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?,
         command => {
             return Err(RecorderDiagnostic::invalid_arguments(format!(
                 "unknown command: {command}"
@@ -2610,6 +2612,17 @@ fn is_beam_target(target_command: &str) -> bool {
     )
 }
 
+/// Pick the BEAM source language to record in `trace_meta.json` based on the
+/// target launcher. Mix-driven runs are Elixir-first; plain `erl` and rebar3
+/// runs are Erlang-first. Non-BEAM and unknown targets keep the legacy
+/// "elixir" default for backward compatibility with M2/M3 fixtures.
+fn detect_target_language(target_command: &str) -> &'static str {
+    match target_program_name(target_command).as_str() {
+        "erl" | "rebar3" => "erlang",
+        _ => "elixir",
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RuntimeCompiler {
     Erlc,
@@ -4323,7 +4336,7 @@ fn write_trace_meta_json(
     target_exit_code: i32,
 ) -> Result<(), Box<dyn Error>> {
     let meta = CompatibilityTraceMeta {
-        language: "elixir",
+        language: detect_target_language(&session.options.target[0]),
         recorder: BINARY_NAME,
         recorder_version: VERSION,
         format: "ctfs",
@@ -4496,6 +4509,229 @@ fn fixture_source_path() -> PathBuf {
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(FIXTURE_SOURCE)
+}
+
+#[derive(Debug)]
+struct ReadBundleSummaryOptions {
+    bundle_dir: PathBuf,
+    ct_file_name: Option<String>,
+}
+
+fn parse_read_bundle_summary_options(
+    args: Vec<String>,
+) -> Result<ReadBundleSummaryOptions, Box<dyn Error>> {
+    let mut bundle_dir: Option<PathBuf> = None;
+    let mut ct_file_name: Option<String> = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-b" | "--bundle" => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{arg} requires a directory").into());
+                };
+                bundle_dir = Some(PathBuf::from(value));
+            }
+            "--ct-file" => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{arg} requires a file name").into());
+                };
+                ct_file_name = Some(value);
+            }
+            other if other.starts_with("--bundle=") => {
+                bundle_dir = Some(PathBuf::from(other.trim_start_matches("--bundle=")));
+            }
+            other if other.starts_with("--ct-file=") => {
+                ct_file_name = Some(other.trim_start_matches("--ct-file=").to_string());
+            }
+            other => return Err(format!("unexpected read-bundle-summary argument: {other}").into()),
+        }
+    }
+    let bundle_dir =
+        bundle_dir.ok_or_else(|| "read-bundle-summary requires --bundle DIR".to_string())?;
+    Ok(ReadBundleSummaryOptions {
+        bundle_dir,
+        ct_file_name,
+    })
+}
+
+#[derive(Serialize)]
+struct BundleSummary {
+    status: &'static str,
+    format: &'static str,
+    reader: &'static str,
+    bundle_dir: String,
+    ct_path: String,
+    program: String,
+    workdir: String,
+    path_count: u64,
+    step_count: u64,
+    event_count: u64,
+    thread_start_count_root: u64,
+    thread_switch_count_root: u64,
+    thread_exit_count_root: u64,
+    language: String,
+    runtime_session_mode: String,
+    runtime_session_delivered: bool,
+    runtime_session_root_thread_id: u64,
+    runtime_session_root_pid: Option<String>,
+    sources: Vec<String>,
+    trace_meta_format: String,
+    sidecar_trace_delivered: bool,
+}
+
+fn read_bundle_summary_command(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let options = parse_read_bundle_summary_options(args)?;
+    let summary = read_bundle_summary(&options)?;
+    println!("{}", serde_json::to_string(&summary)?);
+    Ok(())
+}
+
+/// Open a recorded CTFS bundle through the same `NimTraceReaderHandle` that
+/// `ctfs_writer_bridge_test.exs` uses, then emit a JSON summary covering
+/// thread lifecycle counts, language metadata, and sidecar finalization. This
+/// is consumed by `tests/integration/runtime_session_test.exs` so the M4
+/// integration tests assert on real reader output without parsing CTFS bytes
+/// themselves.
+fn read_bundle_summary(
+    options: &ReadBundleSummaryOptions,
+) -> Result<BundleSummary, Box<dyn Error>> {
+    let bundle_dir = options.bundle_dir.canonicalize().map_err(|error| {
+        format!(
+            "bundle directory not found: {}: {error}",
+            options.bundle_dir.display()
+        )
+    })?;
+
+    let ct_path = match &options.ct_file_name {
+        Some(name) => bundle_dir.join(name),
+        None => find_single_ct_file(&bundle_dir)?,
+    };
+    if !ct_path.is_file() {
+        return Err(format!("CTFS bundle not found at {}", ct_path.display()).into());
+    }
+
+    let reader =
+        NimTraceReaderHandle::open(ct_path.to_str().ok_or("CTFS path is not valid UTF-8")?)?;
+
+    let mut thread_start_count_root: u64 = 0;
+    let mut thread_switch_count_root: u64 = 0;
+    let mut thread_exit_count_root: u64 = 0;
+    for index in 0..reader.step_count() {
+        let step = reader.step_json(index)?;
+        if step.contains("\"thread_id\":1") {
+            if step.contains("\"kind\":\"thread_start\"") {
+                thread_start_count_root += 1;
+            } else if step.contains("\"kind\":\"thread_switch\"") {
+                thread_switch_count_root += 1;
+            } else if step.contains("\"kind\":\"thread_exit\"") {
+                thread_exit_count_root += 1;
+            }
+        }
+    }
+
+    let trace_meta_path = bundle_dir.join("trace_meta.json");
+    let trace_meta_text = fs::read_to_string(&trace_meta_path).map_err(|error| {
+        format!(
+            "failed to read trace_meta.json at {}: {error}",
+            trace_meta_path.display()
+        )
+    })?;
+    let trace_meta: serde_json::Value = serde_json::from_str(&trace_meta_text)?;
+
+    let language = trace_meta
+        .get("language")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let trace_meta_format = trace_meta
+        .get("format")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let runtime_session = trace_meta.get("runtime_session");
+    let runtime_session_mode = runtime_session
+        .and_then(|value| value.get("mode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let runtime_session_delivered = runtime_session
+        .and_then(|value| value.get("delivered"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let runtime_session_root_thread_id = runtime_session
+        .and_then(|value| value.get("root_thread_id"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let runtime_session_root_pid = runtime_session
+        .and_then(|value| value.get("root_pid"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    let sources = trace_meta
+        .get("sources")
+        .and_then(|value| value.as_array())
+        .map(|sources| {
+            sources
+                .iter()
+                .filter_map(|source| {
+                    source
+                        .get("trace_copy_path")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let sidecar_path = bundle_dir.join("runtime_session.jsonl");
+    let sidecar_trace_delivered = match fs::read_to_string(&sidecar_path) {
+        Ok(text) => text.contains("\"event\":\"trace_delivered\""),
+        Err(_) => false,
+    };
+
+    Ok(BundleSummary {
+        status: "ok",
+        format: "ctfs",
+        reader: "codetracer_trace_writer_nim::NimTraceReaderHandle",
+        bundle_dir: bundle_dir.display().to_string(),
+        ct_path: ct_path.display().to_string(),
+        program: reader.program(),
+        workdir: reader.workdir(),
+        path_count: reader.path_count(),
+        step_count: reader.step_count(),
+        event_count: reader.event_count(),
+        thread_start_count_root,
+        thread_switch_count_root,
+        thread_exit_count_root,
+        language,
+        runtime_session_mode,
+        runtime_session_delivered,
+        runtime_session_root_thread_id,
+        runtime_session_root_pid,
+        sources,
+        trace_meta_format,
+        sidecar_trace_delivered,
+    })
+}
+
+fn find_single_ct_file(bundle_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(bundle_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("ct") {
+            matches.push(path);
+        }
+    }
+    match matches.len() {
+        0 => Err(format!("no .ct files found in bundle dir {}", bundle_dir.display()).into()),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "multiple .ct files found in bundle dir {}; pass --ct-file NAME",
+            bundle_dir.display()
+        )
+        .into()),
+    }
 }
 
 #[cfg(test)]
