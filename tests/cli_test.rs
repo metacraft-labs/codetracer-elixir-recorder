@@ -1704,6 +1704,137 @@ fn e2e_runtime_records_erlang_spawn_messages() {
 }
 
 #[test]
+fn e2e_erlang_receive_matrix_process_constructs() {
+    let recorded = record_erlang_fixture_function(
+        "m13-erlang-receive-matrix",
+        "receive_matrix",
+        "receive_matrix",
+        "main",
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "receive-matrix-ok\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    let messages = sidecar_message_events(&events);
+
+    let selective_send = find_message_event(&messages, "send", "selective_receive");
+    let selective_receive = find_message_event(&messages, "receive", "selective_receive");
+    let leftover_send = find_message_event(&messages, "send", "leftover_message");
+    let leftover_receive = find_message_event(&messages, "receive", "leftover_message");
+    let timeout_send = find_message_event(&messages, "send", "timeout_result");
+    let timeout_receive = find_message_event(&messages, "receive", "timeout_result");
+    let registered_send = find_message_event(&messages, "send", "registered_send");
+    let registered_receive = find_message_event(&messages, "receive", "registered_send");
+    let spawn3_ready_send = find_message_event(&messages, "send", "spawn3_ready");
+    let spawn3_ready_receive = find_message_event(&messages, "receive", "spawn3_ready");
+    let spawn3_request_send = find_message_event(&messages, "send", "spawn3_request");
+    let spawn3_request_receive = find_message_event(&messages, "receive", "spawn3_request");
+    let spawn3_result_send = find_message_event(&messages, "send", "spawn3_result");
+    let spawn3_result_receive = find_message_event(&messages, "receive", "spawn3_result");
+    let linked_done_send = find_message_event(&messages, "send", "linked_worker_done");
+    let linked_done_receive = find_message_event(&messages, "receive", "linked_worker_done");
+    let linked_exit_receive = find_message_event(&messages, "receive", "EXIT");
+    let monitor_done_send = find_message_event(&messages, "send", "monitor_worker_done");
+    let monitor_done_receive = find_message_event(&messages, "receive", "monitor_worker_done");
+    let monitor_down_receive = find_message_event(&messages, "receive", "DOWN");
+
+    assert_eq!(selective_send["recipient_thread_id"], 1);
+    assert_eq!(selective_receive["recipient_thread_id"], 1);
+    assert_eq!(leftover_send["recipient_thread_id"], 1);
+    assert_eq!(leftover_receive["recipient_thread_id"], 1);
+    assert_eq!(timeout_send["recipient_thread_id"], 1);
+    assert_eq!(timeout_receive["recipient_thread_id"], 1);
+    assert_eq!(registered_receive["recipient_thread_id"], 1);
+    assert_eq!(linked_exit_receive["recipient_thread_id"], 1);
+    assert_eq!(monitor_down_receive["recipient_thread_id"], 1);
+    assert_eq!(
+        registered_send["sender_thread_id"],
+        registered_receive["sender_thread_id"]
+    );
+    assert_eq!(
+        spawn3_ready_send["sender_pid"],
+        spawn3_ready_receive["sender_pid"]
+    );
+    assert_eq!(
+        spawn3_request_send["recipient_pid"],
+        spawn3_request_receive["recipient_pid"]
+    );
+    assert_eq!(
+        spawn3_result_send["sender_pid"],
+        spawn3_result_receive["sender_pid"]
+    );
+    assert_eq!(
+        linked_done_send["sender_pid"],
+        linked_done_receive["sender_pid"]
+    );
+    assert_eq!(
+        monitor_done_send["sender_pid"],
+        monitor_done_receive["sender_pid"]
+    );
+
+    let spawn3_thread_id = spawn3_request_receive["recipient_thread_id"]
+        .as_u64()
+        .expect("spawn/3 worker thread id");
+    let linked_thread_id = linked_done_send["sender_thread_id"]
+        .as_u64()
+        .expect("linked worker thread id");
+    let monitor_thread_id = monitor_done_send["sender_thread_id"]
+        .as_u64()
+        .expect("monitored worker thread id");
+
+    let starts = sidecar_thread_ids(&events, "thread_start");
+    let exits = sidecar_thread_ids(&events, "thread_exit");
+    let switches = sidecar_thread_ids(&events, "thread_switch");
+    for (label, thread_id) in [
+        ("spawn/3 worker", spawn3_thread_id),
+        ("linked worker", linked_thread_id),
+        ("monitored worker", monitor_thread_id),
+    ] {
+        assert!(
+            starts.contains(&thread_id),
+            "{label} should have ThreadStart: {events:#?}"
+        );
+        assert!(
+            exits.contains(&thread_id),
+            "{label} should have ThreadExit: {events:#?}"
+        );
+        assert!(
+            switches.contains(&thread_id),
+            "{label} should have ThreadSwitch: {events:#?}"
+        );
+        assert_reader_thread_event(&recorded.out_dir, "erl.ct", "thread_start", thread_id);
+        assert_reader_thread_event(&recorded.out_dir, "erl.ct", "thread_switch", thread_id);
+        assert_reader_thread_event(&recorded.out_dir, "erl.ct", "thread_exit", thread_id);
+    }
+
+    assert_reader_trace_log_contains(
+        &recorded.out_dir,
+        "erl.ct",
+        &[
+            "selective_receive",
+            "leftover_message",
+            "timeout_result",
+            "registered_send",
+            "spawn3_ready",
+            "spawn3_request",
+            "spawn3_result",
+            "linked_worker_done",
+            "EXIT",
+            "monitor_worker_done",
+            "DOWN",
+        ],
+    );
+}
+
+#[test]
 fn e2e_runtime_trace_delivered_flush_barrier() {
     let recorded = record_erlang_spawn_function("m6-flush-barrier", "flood");
     assert_eq!(
