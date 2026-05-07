@@ -1381,6 +1381,109 @@ fn assert_reader_value(pairs: &[(String, i64)], name: &str, value: i64) {
     );
 }
 
+fn normalized_elixir_variable_name(name: &str) -> &str {
+    let stripped = name.strip_prefix('_').unwrap_or(name);
+    stripped.split('@').next().unwrap_or(stripped)
+}
+
+fn sidecar_elixir_binding_values<'a>(binds: &'a [Value], source_name: &str) -> Vec<&'a Value> {
+    binds
+        .iter()
+        .filter(|event| {
+            event["source_language"] == "elixir"
+                && event["name"]
+                    .as_str()
+                    .is_some_and(|name| normalized_elixir_variable_name(name) == source_name)
+        })
+        .map(|event| &event["value"])
+        .collect()
+}
+
+fn assert_sidecar_elixir_binding(binds: &[Value], source_name: &str, value: i64) {
+    assert!(
+        binds.iter().any(|event| {
+            event["source_language"] == "elixir"
+                && event["name"]
+                    .as_str()
+                    .is_some_and(|name| normalized_elixir_variable_name(name) == source_name)
+                && reader_value_int(&event["value"]) == Some(value)
+                && event["frame_id"].as_u64().is_some()
+                && event["runtime_variable_id"].as_u64().is_some()
+                && event["slot_template"]
+                    .as_str()
+                    .is_some_and(|slot| slot.contains("Elixir."))
+        }),
+        "missing sidecar Elixir variable binding {source_name}={value}: {binds:#?}"
+    );
+}
+
+fn assert_sidecar_elixir_list_binding(binds: &[Value], source_name: &str, element_count: usize) {
+    let values = sidecar_elixir_binding_values(binds, source_name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "list"
+                && value["elements"]
+                    .as_array()
+                    .is_some_and(|elements| elements.len() == element_count)
+        }),
+        "missing sidecar Elixir list binding {source_name} with {element_count} elements: {values:#?}"
+    );
+}
+
+fn assert_sidecar_elixir_map_struct_binding(
+    binds: &[Value],
+    source_name: &str,
+    field_count: usize,
+) {
+    let values = sidecar_elixir_binding_values(binds, source_name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "map_struct"
+                && value["fields"]
+                    .as_array()
+                    .is_some_and(|fields| fields.len() == field_count)
+        }),
+        "missing sidecar Elixir map/struct binding {source_name} with {field_count} fields: {values:#?}"
+    );
+}
+
+fn assert_sidecar_elixir_string_binding(binds: &[Value], source_name: &str, text: &str) {
+    let values = sidecar_elixir_binding_values(binds, source_name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "string" && value["value"] == text && value["lang_type"] == "binary"
+        }),
+        "missing sidecar Elixir string binding {source_name}={text:?}: {values:#?}"
+    );
+}
+
+fn assert_reader_elixir_value(pairs: &[(String, i64)], source_name: &str, value: i64) {
+    assert!(
+        pairs.iter().any(|(observed_name, observed_value)| {
+            normalized_elixir_variable_name(observed_name) == source_name
+                && *observed_value == value
+        }),
+        "missing CTFS reader Elixir value {source_name}={value}: {pairs:#?}"
+    );
+}
+
+fn assert_raw_elixir_value(
+    values: &[(String, ValueRecord)],
+    source_name: &str,
+    description: &str,
+    predicate: impl Fn(&ValueRecord) -> bool,
+) {
+    let matches = values
+        .iter()
+        .filter(|(observed_name, _)| normalized_elixir_variable_name(observed_name) == source_name)
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    assert!(
+        matches.iter().any(|value| predicate(value)),
+        "missing raw CTFS Elixir value {source_name} matching {description}: {matches:#?}"
+    );
+}
+
 fn find_message_event<'a>(messages: &'a [&'a Value], direction: &str, tag: &str) -> &'a Value {
     messages
         .iter()
@@ -2282,6 +2385,249 @@ fn e2e_mix_records_basic_elixir_app() {
         !raw_ctfs_call_return_values(&recorded.out_dir).is_empty(),
         "raw CTFS calls.dat should contain real Mix call records"
     );
+}
+
+#[test]
+fn e2e_elixir_constructs_core_matrix() {
+    let recorded = record_mix_task_eval(
+        "m13-elixir-constructs-core",
+        "constructs_core",
+        "ConstructsCore.main()",
+        &[],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("constructs-core-ok:674"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    for (function, arity) in [
+        ("main", 0),
+        ("pattern_matrix", 0),
+        ("access_matrix", 0),
+        ("branch_matrix", 1),
+        ("defaults_matrix", 1),
+        ("defaults_matrix", 3),
+        ("classify", 1),
+        ("with_matrix", 1),
+        ("fetch_piece", 2),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "call"
+                    && event["module"] == "Elixir.ConstructsCore"
+                    && event["function"] == function
+                    && event["arity"] == arity
+                    && event["source_location"]["trace_copy_path"]
+                        == "files/lib/constructs_core.ex"
+                    && event["source_location"]["resolution"] == "source_map"
+            }),
+            "runtime sidecar should include public call Elixir.ConstructsCore.{function}/{arity} with source-map metadata: {events:#?}"
+        );
+    }
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.ConstructsCore"
+                && event["function"] == "private_offset"
+                && event["arity"] == 1
+        }),
+        "private defp should be exercised by the real trace: {events:#?}"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("list_head", 10),
+        ("list_third", 30),
+        ("map_left", 21),
+        ("nested_score", 5),
+        ("binary_digit", 55),
+        ("struct_id", 7),
+        ("struct_zip", 4242),
+        ("nested_head", 3),
+        ("nested_value", 9),
+        ("pinned_amount", 8),
+        ("list_result", 42),
+        ("map_result", 26),
+        ("binary_result", 61),
+        ("struct_result", 11),
+        ("pattern_score", 160),
+        ("access_total", 56),
+        ("with_success", 25),
+        ("with_else", 9),
+        ("branch_score", 64),
+        ("defaults_score", 13),
+        ("guard_score", 117),
+        ("binary_guard_score", 204),
+        ("private_score", 36),
+        ("final_total", 674),
+    ] {
+        assert_sidecar_elixir_binding(&binds, name, value);
+    }
+    assert_sidecar_elixir_list_binding(&binds, "list_rest", 2);
+    assert_sidecar_elixir_string_binding(&binds, "binary_prefix", "ct");
+    assert_sidecar_elixir_string_binding(&binds, "binary_tail", "core");
+    assert_sidecar_elixir_map_struct_binding(&binds, "base_struct", 5);
+    assert_sidecar_elixir_map_struct_binding(&binds, "updated_map", 3);
+    assert_sidecar_elixir_map_struct_binding(&binds, "update_map", 3);
+    assert_sidecar_elixir_map_struct_binding(&binds, "updated_struct", 5);
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["trace_copy_path"] == "files/lib/constructs_core.ex"
+                    && source["build_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("lib/constructs_core.ex"))
+            })
+        }),
+        "trace metadata should expose the ConstructsCore .ex source: {meta:#?}"
+    );
+    assert!(
+        recorded
+            .out_dir
+            .join("files/lib/constructs_core.ex")
+            .is_file(),
+        "trace bundle should copy lib/constructs_core.ex"
+    );
+
+    let source_maps = source_map_jsons(&recorded.out_dir);
+    assert!(
+        source_maps.iter().any(|map| {
+            map["source_language"] == "elixir"
+                && map["original_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("lib/constructs_core.ex"))
+                && map["mappings"]
+                    .as_array()
+                    .is_some_and(|mappings| !mappings.is_empty())
+        }),
+        "source-map artifacts should map generated Erlang forms back to lib/constructs_core.ex: {source_maps:#?}"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.ConstructsCore")
+        .unwrap_or_else(|| panic!("missing ConstructsCore manifest: {manifests:#?}"));
+    assert!(
+        manifest["functions"].as_array().is_some_and(|functions| {
+            [
+                "Elixir.ConstructsCore.main/0",
+                "Elixir.ConstructsCore.pattern_matrix/0",
+                "Elixir.ConstructsCore.access_matrix/0",
+                "Elixir.ConstructsCore.branch_matrix/1",
+                "Elixir.ConstructsCore.defaults_matrix/1",
+                "Elixir.ConstructsCore.defaults_matrix/3",
+                "Elixir.ConstructsCore.classify/1",
+                "Elixir.ConstructsCore.with_matrix/1",
+                "Elixir.ConstructsCore.fetch_piece/2",
+                "Elixir.ConstructsCore.private_offset/1",
+            ]
+            .into_iter()
+            .all(|key| functions.iter().any(|function| function["key"] == key))
+        }) && manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["trace_copy_path"] == "files/lib/constructs_core.ex"
+                    && location["resolution"] == "source_map"
+            })
+        }),
+        "ConstructsCore manifest should expose functions and .ex source-map locations: {manifest:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "mix.ct");
+    assert!(
+        reader.step_count() > 0,
+        "CTFS reader should expose ConstructsCore steps"
+    );
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("lib/constructs_core.ex")),
+        "CTFS reader paths should include lib/constructs_core.ex: {paths:#?}"
+    );
+    let function_names = reader_function_names(&reader);
+    assert!(
+        function_names
+            .iter()
+            .any(|name| name == "ConstructsCore.main/0")
+            && function_names
+                .iter()
+                .any(|name| name == "ConstructsCore.pattern_matrix/0")
+            && function_names
+                .iter()
+                .any(|name| name == "ConstructsCore.access_matrix/0"),
+        "CTFS reader should expose ConstructsCore functions: {function_names:#?}"
+    );
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "ConstructsCore.with_matrix/1")
+            && call_names
+                .iter()
+                .any(|name| name == "ConstructsCore.fetch_piece/2"),
+        "CTFS reader should expose calls across with/else flow: {call_names:#?}"
+    );
+    let pairs = reader_value_pairs(&recorded.out_dir, "mix.ct");
+    for (name, value) in [
+        ("list_result", 42),
+        ("map_result", 26),
+        ("binary_result", 61),
+        ("struct_result", 11),
+        ("final_total", 674),
+    ] {
+        assert_reader_elixir_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "mix.ct");
+    assert_raw_elixir_value(
+        &values,
+        "list_rest",
+        "list with two tail elements",
+        |value| matches!(value, ValueRecord::Sequence { elements, .. } if elements.len() == 2),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "binary_tail",
+        "binary tail string",
+        |value| matches!(value, ValueRecord::String { text, .. } if text == "core"),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "base_struct",
+        "Elixir struct map",
+        |value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 5),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "updated_map",
+        "updated map",
+        |value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 3),
+    );
+    assert_raw_elixir_value(&values, "final_total", "final integer total", |value| {
+        matches!(value, ValueRecord::Int { i: 674, .. })
+    });
+
+    let mut raw_reader =
+        CtfsReader::open(&recorded.out_dir.join("mix.ct")).expect("open raw CTFS trace");
+    for file in ["paths.dat", "calls.dat", "values.dat"] {
+        let payload = raw_reader
+            .read_file(file)
+            .unwrap_or_else(|error| panic!("read raw CTFS {file}: {error}"));
+        assert!(!payload.is_empty(), "raw CTFS {file} should be non-empty");
+    }
 }
 
 #[test]
