@@ -92,6 +92,9 @@ Options:
       --value-max-binary-bytes N
       --value-max-map-pairs N
       --value-max-string-bytes N
+      --tracer-backend BACKEND   Tracer backend: process (default, reference) or native (M16)
+      --tracer-queue-limit N     Native-backend queue size cap (default: 65536)
+      --tracer-overflow-policy P Native-backend overflow policy: block (default) or drop
   -h, --help            Show this help text
   -V, --version         Show recorder version
 
@@ -99,7 +102,10 @@ Environment:
   CODETRACER_BEAM_RECORDER_OUT_DIR    Output directory overridden by --out-dir
                                       (legacy alias: CODETRACER_ELIXIR_RECORDER_OUT_DIR)
   CODETRACER_BEAM_RECORDER_DISABLED   Set to 1 or true to run target without recording
-                                      (legacy alias: CODETRACER_ELIXIR_RECORDER_DISABLED)"
+                                      (legacy alias: CODETRACER_ELIXIR_RECORDER_DISABLED)
+  CODETRACER_BEAM_RECORDER_TRACER_BACKEND   process|native (overridden by --tracer-backend)
+  CODETRACER_BEAM_RECORDER_QUEUE_LIMIT      Native-backend queue size cap
+  CODETRACER_BEAM_RECORDER_OVERFLOW_POLICY  block|drop (default block)"
     );
 }
 
@@ -349,6 +355,69 @@ struct RecordOptions {
     root_mfa: Option<RootMfa>,
     capture_messages: bool,
     value_limits: ValueLimitOptions,
+    /// M16: tracer-backend selection. `process` (default) uses the
+    /// reference gen_server tracer in `codetracer_session.erl`. `native`
+    /// dispatches to `codetracer_native_tracer.erl` which spawns a
+    /// dedicated writer process with atomic sequence numbers, an
+    /// explicit overflow policy, and a shutdown barrier.
+    tracer_backend: TracerBackend,
+    /// M16: queue limit for the native backend. Tests that need to force
+    /// overflow set this to a small value.
+    tracer_queue_limit: Option<u64>,
+    /// M16: overflow policy for the native backend (`block` blocks the
+    /// producer, `drop` increments a counter and emits a
+    /// `recorder_overflow` diagnostic line).
+    tracer_overflow_policy: Option<OverflowPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TracerBackend {
+    Process,
+    Native,
+}
+
+impl TracerBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            TracerBackend::Process => "process",
+            TracerBackend::Native => "native",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, RecorderDiagnostic> {
+        match value {
+            "process" => Ok(TracerBackend::Process),
+            "native" => Ok(TracerBackend::Native),
+            other => Err(RecorderDiagnostic::invalid_arguments(format!(
+                "--tracer-backend expects process|native, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverflowPolicy {
+    Block,
+    Drop,
+}
+
+impl OverflowPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            OverflowPolicy::Block => "block",
+            OverflowPolicy::Drop => "drop",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, RecorderDiagnostic> {
+        match value {
+            "block" => Ok(OverflowPolicy::Block),
+            "drop" => Ok(OverflowPolicy::Drop),
+            other => Err(RecorderDiagnostic::invalid_arguments(format!(
+                "--tracer-overflow-policy expects block|drop, got {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -407,6 +476,9 @@ fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, Record
     let mut root_mfa = None;
     let mut capture_messages = true;
     let mut value_limits = ValueLimitOptions::default();
+    let mut tracer_backend = tracer_backend_env()?;
+    let mut tracer_queue_limit = tracer_queue_limit_env()?;
+    let mut tracer_overflow_policy = tracer_overflow_policy_env()?;
     let mut target = Vec::new();
     let mut index = 0;
 
@@ -511,6 +583,65 @@ fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, Record
                 index += 1;
                 value_limits.max_string_bytes = Some(parse_u32_option(arg, args.get(index))?);
             }
+            "--tracer-backend" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires process|native"
+                    )));
+                };
+                tracer_backend = TracerBackend::parse(value)?;
+            }
+            "--tracer-queue-limit" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires a positive integer"
+                    )));
+                };
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    RecorderDiagnostic::invalid_arguments(format!(
+                        "--tracer-queue-limit requires a positive integer, got {value}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(RecorderDiagnostic::invalid_arguments(
+                        "--tracer-queue-limit must be > 0",
+                    ));
+                }
+                tracer_queue_limit = Some(parsed);
+            }
+            "--tracer-overflow-policy" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(RecorderDiagnostic::invalid_arguments(format!(
+                        "{arg} requires block|drop"
+                    )));
+                };
+                tracer_overflow_policy = Some(OverflowPolicy::parse(value)?);
+            }
+            _ if arg.starts_with("--tracer-backend=") => {
+                tracer_backend = TracerBackend::parse(arg.trim_start_matches("--tracer-backend="))?;
+            }
+            _ if arg.starts_with("--tracer-queue-limit=") => {
+                let value = arg.trim_start_matches("--tracer-queue-limit=");
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    RecorderDiagnostic::invalid_arguments(format!(
+                        "--tracer-queue-limit requires a positive integer, got {value}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(RecorderDiagnostic::invalid_arguments(
+                        "--tracer-queue-limit must be > 0",
+                    ));
+                }
+                tracer_queue_limit = Some(parsed);
+            }
+            _ if arg.starts_with("--tracer-overflow-policy=") => {
+                tracer_overflow_policy = Some(OverflowPolicy::parse(
+                    arg.trim_start_matches("--tracer-overflow-policy="),
+                )?);
+            }
             _ if arg.starts_with("--out-dir=") => {
                 out_dir = Some(PathBuf::from(arg.trim_start_matches("--out-dir=")));
             }
@@ -563,7 +694,44 @@ fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, Record
         root_mfa,
         capture_messages,
         value_limits,
+        tracer_backend,
+        tracer_queue_limit,
+        tracer_overflow_policy,
     })))
+}
+
+fn tracer_backend_env() -> Result<TracerBackend, RecorderDiagnostic> {
+    match env::var("CODETRACER_BEAM_RECORDER_TRACER_BACKEND") {
+        Ok(value) => TracerBackend::parse(&value),
+        Err(_) => Ok(TracerBackend::Process),
+    }
+}
+
+fn tracer_queue_limit_env() -> Result<Option<u64>, RecorderDiagnostic> {
+    match env::var("CODETRACER_BEAM_RECORDER_QUEUE_LIMIT") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| {
+                RecorderDiagnostic::invalid_arguments(format!(
+                    "CODETRACER_BEAM_RECORDER_QUEUE_LIMIT requires a positive integer, got {value}"
+                ))
+            })
+            .and_then(|opt| match opt {
+                Some(0) => Err(RecorderDiagnostic::invalid_arguments(
+                    "CODETRACER_BEAM_RECORDER_QUEUE_LIMIT must be > 0",
+                )),
+                other => Ok(other),
+            }),
+        Err(_) => Ok(None),
+    }
+}
+
+fn tracer_overflow_policy_env() -> Result<Option<OverflowPolicy>, RecorderDiagnostic> {
+    match env::var("CODETRACER_BEAM_RECORDER_OVERFLOW_POLICY") {
+        Ok(value) => OverflowPolicy::parse(&value).map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 fn parse_build_options(args: Vec<String>) -> Result<BuildParseResult, RecorderDiagnostic> {
@@ -1310,6 +1478,12 @@ struct RuntimeSession {
     trace_functions: Vec<TraceFunctionSpec>,
     step_locations: Vec<TraceLocationSpec>,
     capture_messages: bool,
+    /// M16: tracer-backend selection (default `process`).
+    tracer_backend: TracerBackend,
+    /// M16: optional queue-size cap for the native backend.
+    tracer_queue_limit: Option<u64>,
+    /// M16: optional overflow policy for the native backend.
+    tracer_overflow_policy: Option<OverflowPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1766,6 +1940,9 @@ impl RuntimeSession {
             trace_functions,
             step_locations: instrumentation.locations,
             capture_messages: options.capture_messages,
+            tracer_backend: options.tracer_backend,
+            tracer_queue_limit: options.tracer_queue_limit,
+            tracer_overflow_policy: options.tracer_overflow_policy,
         })
     }
 
@@ -1795,6 +1972,9 @@ impl RuntimeSession {
             trace_functions: build.trace_functions,
             step_locations: build.step_locations,
             capture_messages: options.capture_messages,
+            tracer_backend: options.tracer_backend,
+            tracer_queue_limit: options.tracer_queue_limit,
+            tracer_overflow_policy: options.tracer_overflow_policy,
         })
     }
 
@@ -2790,6 +2970,7 @@ fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, 
         "codetracer_session.erl",
         "codetracer_forms.erl",
         "codetracer_value_encoder.erl",
+        "codetracer_native_tracer.erl",
     ] {
         let source = src_dir.join(module);
         let output = compile_erlang_runtime_source(&source, &ebin_dir, compiler)?;
@@ -3995,8 +4176,19 @@ fn erlang_eval_expression_body(expression: &str) -> String {
 }
 
 fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
+    let mut extras = String::new();
+    extras.push_str(&format!(
+        ", {{:tracer_backend, :{}}}",
+        runtime.tracer_backend.as_str()
+    ));
+    if let Some(limit) = runtime.tracer_queue_limit {
+        extras.push_str(&format!(", {{:queue_limit, {limit}}}"));
+    }
+    if let Some(policy) = runtime.tracer_overflow_policy {
+        extras.push_str(&format!(", {{:overflow_policy, :{}}}", policy.as_str()));
+    }
     format!(
-        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}, {{:capture_messages, {capture_messages}}}]",
+        "[{{:session_file, {session_file}}}, {{:source_paths, {source_paths}}}, {{:manifest_paths, {manifest_paths}}}, {{:trace_functions, {trace_functions}}}, {{:capture_messages, {capture_messages}}}{extras}]",
         session_file = elixir_charlist(&runtime.session_file.display().to_string()),
         source_paths = elixir_charlist_list(&runtime.source_paths),
         manifest_paths = elixir_string_list(
@@ -4007,13 +4199,25 @@ fn elixir_runtime_options(runtime: &RuntimeSession) -> String {
                 .collect::<Vec<_>>()
         ),
         trace_functions = elixir_trace_function_list(&runtime.trace_functions),
-        capture_messages = runtime.capture_messages
+        capture_messages = runtime.capture_messages,
+        extras = extras
     )
 }
 
 fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
+    let mut extras = String::new();
+    extras.push_str(&format!(
+        ",{{tracer_backend,{}}}",
+        runtime.tracer_backend.as_str()
+    ));
+    if let Some(limit) = runtime.tracer_queue_limit {
+        extras.push_str(&format!(",{{queue_limit,{limit}}}"));
+    }
+    if let Some(policy) = runtime.tracer_overflow_policy {
+        extras.push_str(&format!(",{{overflow_policy,{}}}", policy.as_str()));
+    }
     format!(
-        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{manifest_paths,{manifest_paths}}},{{trace_functions,{trace_functions}}},{{capture_messages,{capture_messages}}}]",
+        "[{{session_file,{session_file}}},{{source_paths,{source_paths}}},{{manifest_paths,{manifest_paths}}},{{trace_functions,{trace_functions}}},{{capture_messages,{capture_messages}}}{extras}]",
         session_file = erlang_string(&runtime.session_file.display().to_string()),
         source_paths = erlang_string_list(&runtime.source_paths),
         manifest_paths = erlang_string_vec(
@@ -4024,7 +4228,8 @@ fn erlang_runtime_options(runtime: &RuntimeSession) -> String {
                 .collect::<Vec<_>>()
         ),
         trace_functions = erlang_trace_function_list(&runtime.trace_functions),
-        capture_messages = runtime.capture_messages
+        capture_messages = runtime.capture_messages,
+        extras = extras
     )
 }
 

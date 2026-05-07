@@ -141,7 +141,7 @@ fi
 require_text Justfile 'bump-version new_version:' "Justfile has bump-version recipe"
 
 require_json_sha codetracer 1cf386d69b53dd2c5bf9ec84fb87581e35404822
-require_json_sha codetracer-trace-format cb2b67f120cb76a4d6db0b623ba37caf60ef96e4
+require_json_sha codetracer-trace-format c5dc5a9f79ca3be03e4d865cd1779ef823b21071
 
 require_text src/main.rs 'codetracer-beam-recorder' "CLI binary identifies recorder name"
 require_text src/main.rs '--out-dir' "CLI help documents --out-dir"

@@ -5,4 +5,4 @@
   {applications, [kernel, stdlib]},
   {mod, {codetracer_session, []}},
   {modules, [codetracer_erlang_runtime, codetracer_session, codetracer_forms,
-             codetracer_value_encoder]}]}.
+             codetracer_value_encoder, codetracer_native_tracer]}]}.
