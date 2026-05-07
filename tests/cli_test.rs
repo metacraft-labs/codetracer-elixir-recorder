@@ -1027,6 +1027,19 @@ fn assert_sidecar_record_binding(
     );
 }
 
+fn assert_sidecar_map_struct_binding(binds: &[Value], name: &str, field_count: usize) {
+    let values = sidecar_binding_values(binds, name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "map_struct"
+                && value["fields"]
+                    .as_array()
+                    .is_some_and(|fields| fields.len() == field_count)
+        }),
+        "missing sidecar map binding {name} with {field_count} fields: {values:#?}"
+    );
+}
+
 fn sidecar_value_contains_record_tag(value: &Value, record_tag: &str) -> bool {
     if value["kind"] == "record" && value["record_tag"] == record_tag {
         return true;
@@ -3215,6 +3228,243 @@ fn e2e_erlang_syntax_matrix_constructs() {
     assert!(matches!(
         find_named_value(&values, "FinalTotal"),
         ValueRecord::Int { i: 658, .. }
+    ));
+}
+
+#[test]
+fn e2e_erlang_comprehension_matrix_constructs() {
+    let recorded = record_erlang_fixture_function(
+        "m13-erlang-comprehension-matrix",
+        "comprehension_matrix",
+        "comprehension_matrix",
+        "main",
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "comprehension-matrix-ok:656\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "comprehension_matrix"
+                && event["function"] == "main"
+                && event["arity"] == 0
+                && event["source_location"]["trace_copy_path"]
+                    == "files/src/comprehension_matrix.erl"
+        }),
+        "runtime sidecar should contain comprehension_matrix:main/0 with source metadata: {events:#?}"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("ListScore", 120),
+        ("PairScore", 68),
+        ("BinaryFilterScore", 325),
+        ("BinaryListScore", 18),
+        ("MapGenScore", 82),
+        ("MapListScore", 19),
+        ("CrossMapScore", 24),
+        ("FinalTotal", 656),
+    ] {
+        assert_sidecar_binding(&binds, name, value);
+    }
+    assert_sidecar_list_binding(&binds, "ListSquares", 4);
+    assert_sidecar_list_binding(&binds, "NestedPairs", 4);
+    assert_sidecar_map_struct_binding(&binds, "MapFiltered", 2);
+    assert_sidecar_map_struct_binding(&binds, "MapFromPairs", 2);
+    assert!(
+        sidecar_binding_values(&binds, "BinaryFiltered")
+            .iter()
+            .any(|value| {
+                value["kind"] == "raw"
+                    && value["lang_type"] == "binary"
+                    && value["value"] == "0x00FF4105"
+            }),
+        "binary comprehension result should be sidecar-visible: {binds:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    assert!(
+        reader.step_count() > 0,
+        "reader should expose comprehension-matrix steps"
+    );
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "comprehension_matrix:main/0"),
+        "CTFS reader should expose comprehension_matrix:main/0 call records: {call_names:#?}"
+    );
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "erl.ct");
+    for (name, value) in [
+        ("ListScore", 120),
+        ("BinaryFilterScore", 325),
+        ("MapGenScore", 82),
+        ("FinalTotal", 656),
+    ] {
+        assert_reader_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    assert!(matches!(
+        find_named_value(&values, "ListSquares"),
+        ValueRecord::Sequence { elements, .. } if elements.len() == 4
+    ));
+    assert!(matches!(
+        find_named_value(&values, "NestedPairs"),
+        ValueRecord::Sequence { elements, .. } if elements.len() == 4
+    ));
+    assert!(matches!(
+        find_named_value(&values, "BinaryFiltered"),
+        ValueRecord::Raw { r, .. } if r == "0x00FF4105"
+    ));
+    assert!(matches!(
+        find_named_value(&values, "MapFiltered"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "MapFromPairs"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "FinalTotal"),
+        ValueRecord::Int { i: 656, .. }
+    ));
+}
+
+#[test]
+fn e2e_erlang_exceptions_matrix_constructs() {
+    let recorded = record_erlang_fixture_function(
+        "m13-erlang-exceptions-matrix",
+        "exceptions_matrix",
+        "exceptions_matrix",
+        "main",
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "exceptions-matrix-ok:67\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "exceptions_matrix"
+                && event["function"] == "main"
+                && event["arity"] == 0
+                && event["source_location"]["trace_copy_path"] == "files/src/exceptions_matrix.erl"
+        }),
+        "runtime sidecar should contain exceptions_matrix:main/0 with source metadata: {events:#?}"
+    );
+    for (function, class, reason) in [
+        ("thrower", "throw", "{thrown,21}"),
+        ("errorer", "error", "{bad_input,4}"),
+        ("exiter", "exit", "{exit_reason,9}"),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "exception_from"
+                    && event["module"] == "exceptions_matrix"
+                    && event["function"] == function
+                    && event["arity"] == 1
+                    && event["class"] == class
+                    && event["reason_repr"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(reason))
+            }),
+            "sidecar should expose exception_from for {function}/1 {class}:{reason}: {events:#?}"
+        );
+    }
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    assert_sidecar_record_binding(&binds, "CatchThrow", "catch_expr_throw", 2, None);
+    assert_sidecar_record_binding(&binds, "CatchExit", "EXIT", 2, Some("catch_expr_exit"));
+    assert_sidecar_record_binding(&binds, "TryThrowResult", "caught_throw", 2, None);
+    assert_sidecar_record_binding(&binds, "TryErrorResult", "caught_error", 2, None);
+    assert_sidecar_record_binding(&binds, "TryExitResult", "caught_exit", 2, None);
+    assert_sidecar_record_binding(&binds, "TrySuccess", "success", 2, None);
+    assert_sidecar_binding(&binds, "AfterScore", 4);
+    assert_sidecar_binding(&binds, "FinalTotal", 67);
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    assert!(
+        reader.step_count() > 0,
+        "reader should expose exceptions-matrix steps"
+    );
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "exceptions_matrix:succeed/1")
+            && call_names
+                .iter()
+                .any(|name| name == "exceptions_matrix:after_score/1"),
+        "CTFS reader should expose real call records for successful and after-observed paths: {call_names:#?}"
+    );
+
+    let event_payloads = (0..reader.event_count())
+        .map(|index| {
+            decode_reader_event_content(&reader.event_json(index).expect("read event json"))
+        })
+        .collect::<Vec<_>>();
+    for reason in ["{thrown,21}", "{bad_input,4}", "{exit_reason,9}"] {
+        assert!(
+            event_payloads.iter().any(|payload| {
+                payload.contains("codetracer.elixir.exception_from.v1")
+                    && payload.contains("exceptions_matrix")
+                    && payload.contains(reason)
+            }),
+            "CTFS reader should expose exception_from event for {reason}: {event_payloads:#?}"
+        );
+    }
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "erl.ct");
+    assert_reader_value(&pairs, "AfterScore", 4);
+    assert_reader_value(&pairs, "FinalTotal", 67);
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    assert!(matches!(
+        find_named_value(&values, "CatchThrow"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "CatchExit"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TryThrowResult"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TryErrorResult"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TryExitResult"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TrySuccess"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "FinalTotal"),
+        ValueRecord::Int { i: 67, .. }
     ));
 }
 
