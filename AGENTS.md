@@ -1,9 +1,9 @@
-# codetracer-elixir-recorder
+# codetracer-beam-recorder
 
-This repository contains the public scaffold for the CodeTracer Elixir and
-Erlang materialized trace recorder. M0 intentionally provides packaging,
-compliance checks, and a minimal CLI only; recorder behavior starts in later
-milestones.
+This repository contains the public scaffold for the CodeTracer BEAM
+materialized trace recorder (Erlang and Elixir). M0 intentionally provides
+packaging, compliance checks, and a minimal CLI only; recorder behavior starts
+in later milestones.
 
 ## Commands
 
@@ -25,7 +25,9 @@ milestones.
 
 ## Conventions
 
-- Keep the binary name `codetracer-elixir-recorder`.
+- Keep the binary name `codetracer-beam-recorder` (the legacy
+  `codetracer-elixir-recorder` is retained as a deprecation alias for one
+  release cycle).
 - Keep `Cargo.toml` as the version source of truth and update it through
   `just bump-version`.
 - Do not add recorder behavior without real integration tests that exercise the

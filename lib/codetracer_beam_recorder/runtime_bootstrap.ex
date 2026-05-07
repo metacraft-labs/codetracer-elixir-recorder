@@ -1,4 +1,4 @@
-defmodule CodetracerElixirRecorder.RuntimeBootstrap do
+defmodule CodetracerBeamRecorder.RuntimeBootstrap do
   @moduledoc false
 
   def start_session(options) do

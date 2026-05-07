@@ -23,7 +23,7 @@ defmodule Mix.Tasks.Compile.Codetracer do
     end
 
     result =
-      CodetracerElixirRecorder.ElixirSourceMap.build_mix_project(
+      CodetracerBeamRecorder.ElixirSourceMap.build_mix_project(
         build_dir: opts[:build_dir],
         include_apps: Keyword.get_values(opts, :include_app),
         exclude_apps: Keyword.get_values(opts, :exclude_app),

@@ -1,6 +1,6 @@
 ExUnit.start()
 
-defmodule CodetracerElixirRecorder.CtfsWriterBridgeTest do
+defmodule CodetracerBeamRecorder.CtfsWriterBridgeTest do
   use ExUnit.Case, async: false
 
   @repo_root Path.expand("../..", __DIR__)
@@ -65,7 +65,7 @@ defmodule CodetracerElixirRecorder.CtfsWriterBridgeTest do
   end
 
   defp tmp_dir!(label) do
-    path = Path.join(System.tmp_dir!(), "codetracer-elixir-recorder-m2-#{label}-#{System.unique_integer([:positive])}")
+    path = Path.join(System.tmp_dir!(), "codetracer-beam-recorder-m2-#{label}-#{System.unique_integer([:positive])}")
     File.rm_rf!(path)
     File.mkdir_p!(path)
     path

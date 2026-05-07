@@ -135,8 +135,12 @@ app_source_dirs(Apps) ->
     [Src || {_Name, Src} <- Apps, filelib:is_dir(Src)].
 
 recorder_binary() ->
-    case os:getenv("CODETRACER_ELIXIR_RECORDER_BIN") of
-        false -> "codetracer-elixir-recorder";
+    case os:getenv("CODETRACER_BEAM_RECORDER_BIN") of
+        false ->
+            case os:getenv("CODETRACER_ELIXIR_RECORDER_BIN") of
+                false -> "codetracer-beam-recorder";
+                Path -> Path
+            end;
         Path -> Path
     end.
 

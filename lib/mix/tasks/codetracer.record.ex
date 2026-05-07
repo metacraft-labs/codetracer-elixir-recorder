@@ -34,7 +34,7 @@ defmodule Mix.Tasks.Codetracer.Record do
       Mix.raise("invalid codetracer.record options: #{inspect(invalid ++ rest)}")
     end
 
-    build_dir = Path.expand(opts[:build_dir] || CodetracerElixirRecorder.ElixirSourceMap.default_build_dir())
+    build_dir = Path.expand(opts[:build_dir] || CodetracerBeamRecorder.ElixirSourceMap.default_build_dir())
     out_dir = Path.expand(opts[:out_dir] || "ct-traces")
 
     compile_args =
@@ -90,9 +90,11 @@ defmodule Mix.Tasks.Codetracer.Record do
   end
 
   defp recorder_binary! do
-    System.get_env("CODETRACER_ELIXIR_RECORDER_BIN") ||
+    System.get_env("CODETRACER_BEAM_RECORDER_BIN") ||
+      System.get_env("CODETRACER_ELIXIR_RECORDER_BIN") ||
+      System.find_executable("codetracer-beam-recorder") ||
       System.find_executable("codetracer-elixir-recorder") ||
-      Mix.raise("codetracer-elixir-recorder was not found on PATH")
+      Mix.raise("codetracer-beam-recorder was not found on PATH")
   end
 
   defp repeated(_flag, []), do: []

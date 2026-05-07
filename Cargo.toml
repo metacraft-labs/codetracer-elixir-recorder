@@ -1,10 +1,10 @@
 [package]
-name = "codetracer-elixir-recorder"
+name = "codetracer-beam-recorder"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/metacraft-labs/codetracer-elixir-recorder"
-description = "CodeTracer Elixir and Erlang materialized trace recorder"
+repository = "https://github.com/metacraft-labs/codetracer-beam-recorder"
+description = "CodeTracer BEAM materialized trace recorder (Erlang and Elixir)"
 
 [dependencies]
 codetracer_ctfs = { path = "../codetracer-trace-format/codetracer_ctfs" }

@@ -27,7 +27,7 @@ rebar3 as codetrace codetracer
 Provider mode is the default. It compiles normal Rebar3 artifacts under the
 `codetrace` profile, creates instrumented BEAMs and recorder metadata under
 `_build/codetrace/codetracer`, and runs a real `rebar3 as codetrace shell`
-through `codetracer-elixir-recorder record`. Default profile artifacts are not
+through `codetracer-beam-recorder record`. Default profile artifacts are not
 mutated.
 
 Parse-transform compatibility mode is Erlang-only and intentionally narrow:
@@ -37,4 +37,4 @@ add `{parse_transform, codetracer_parse_transform}` to the `codetrace` profile
 Public distribution decision for M13: publish the Rebar3 package as
 `rebar3_codetracer` on Hex, with OTP application `rebar3_codetracer` and
 provider command `codetracer`. The recorder binary remains distributed as
-`codetracer-elixir-recorder`.
+`codetracer-beam-recorder`.

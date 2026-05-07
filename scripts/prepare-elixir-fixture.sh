@@ -6,12 +6,14 @@ usage() {
 Usage: scripts/prepare-elixir-fixture.sh [OUTPUT_DIR]
 
 Records the recorder-owned canonical Elixir Mix fixture with the real
-codetracer-elixir-recorder and writes a CTFS trace fixture to OUTPUT_DIR.
+codetracer-beam-recorder and writes a CTFS trace fixture to OUTPUT_DIR.
 
 Environment:
   ELIXIR_FIXTURE_OUTPUT_DIR       Output directory if OUTPUT_DIR is omitted.
-  CODETRACER_ELIXIR_RECORDER_PATH Recorder repo override.
-  CODETRACER_ELIXIR_RECORDER_BIN  Recorder binary override.
+  CODETRACER_BEAM_RECORDER_PATH   Recorder repo override.
+                                  (legacy alias: CODETRACER_ELIXIR_RECORDER_PATH)
+  CODETRACER_BEAM_RECORDER_BIN    Recorder binary override.
+                                  (legacy alias: CODETRACER_ELIXIR_RECORDER_BIN)
   CODETRACER_ELIXIR_FLOW_TEST     Canonical Mix project override.
   FORCE=1                         Regenerate even when fixture exists.
   CI=1                            Always regenerate; never reuse existing output.
@@ -37,10 +39,15 @@ fi
 
 output_dir="${1:-${ELIXIR_FIXTURE_OUTPUT_DIR:-$script_repo_root/target/fixtures/elixir-canonical-flow}}"
 
-if [[ -n "${CODETRACER_ELIXIR_RECORDER_PATH:-}" ]]; then
+if [[ -n "${CODETRACER_BEAM_RECORDER_PATH:-}" ]]; then
+  recorder_repo="$CODETRACER_BEAM_RECORDER_PATH"
+  [[ -d "$recorder_repo" ]] ||
+    fail "CODETRACER_BEAM_RECORDER_PATH does not exist: $recorder_repo"
+elif [[ -n "${CODETRACER_ELIXIR_RECORDER_PATH:-}" ]]; then
   recorder_repo="$CODETRACER_ELIXIR_RECORDER_PATH"
   [[ -d "$recorder_repo" ]] ||
     fail "CODETRACER_ELIXIR_RECORDER_PATH does not exist: $recorder_repo"
+  printf '[codetracer-beam-recorder] note: CODETRACER_ELIXIR_RECORDER_PATH is deprecated; please use CODETRACER_BEAM_RECORDER_PATH.\n' >&2
 else
   recorder_repo="$script_repo_root"
 fi
@@ -51,10 +58,23 @@ canonical_project="${CODETRACER_ELIXIR_FLOW_TEST:-$recorder_repo/test-programs/e
   fail "canonical Elixir Mix fixture not found: $canonical_project"
 
 find_recorder_bin() {
+  if [[ -n "${CODETRACER_BEAM_RECORDER_BIN:-}" ]]; then
+    [[ -x "$CODETRACER_BEAM_RECORDER_BIN" ]] ||
+      fail "CODETRACER_BEAM_RECORDER_BIN is not executable: $CODETRACER_BEAM_RECORDER_BIN"
+    printf '%s\n' "$CODETRACER_BEAM_RECORDER_BIN"
+    return
+  fi
+
   if [[ -n "${CODETRACER_ELIXIR_RECORDER_BIN:-}" ]]; then
     [[ -x "$CODETRACER_ELIXIR_RECORDER_BIN" ]] ||
       fail "CODETRACER_ELIXIR_RECORDER_BIN is not executable: $CODETRACER_ELIXIR_RECORDER_BIN"
+    printf '[codetracer-beam-recorder] note: CODETRACER_ELIXIR_RECORDER_BIN is deprecated; please use CODETRACER_BEAM_RECORDER_BIN.\n' >&2
     printf '%s\n' "$CODETRACER_ELIXIR_RECORDER_BIN"
+    return
+  fi
+
+  if command -v codetracer-beam-recorder >/dev/null 2>&1; then
+    command -v codetracer-beam-recorder
     return
   fi
 
@@ -64,6 +84,8 @@ find_recorder_bin() {
   fi
 
   for candidate in \
+    "$recorder_repo/target/debug/codetracer-beam-recorder" \
+    "$recorder_repo/target/release/codetracer-beam-recorder" \
     "$recorder_repo/target/debug/codetracer-elixir-recorder" \
     "$recorder_repo/target/release/codetracer-elixir-recorder"; do
     if [[ -x "$candidate" ]]; then
@@ -72,7 +94,7 @@ find_recorder_bin() {
     fi
   done
 
-  fail "codetracer-elixir-recorder binary not found; build the recorder or set CODETRACER_ELIXIR_RECORDER_BIN"
+  fail "codetracer-beam-recorder binary not found; build the recorder or set CODETRACER_BEAM_RECORDER_BIN"
 }
 
 recorder_bin="$(find_recorder_bin)"
@@ -116,7 +138,7 @@ build_dir="$work_dir/codetracer-build"
 mkdir -p "$task_ebin"
 
 task_sources=(
-  "$recorder_repo/lib/codetracer_elixir_recorder/elixir_source_map.ex"
+  "$recorder_repo/lib/codetracer_beam_recorder/elixir_source_map.ex"
   "$recorder_repo/lib/mix/tasks/compile.codetracer.ex"
   "$recorder_repo/lib/mix/tasks/codetracer.record.ex"
 )
@@ -142,8 +164,8 @@ printf 'Recording canonical Elixir fixture from %s\n' "$canonical_project"
     MIX_ENV=test \
     MIX_BUILD_ROOT="$mix_build_root" \
     TMPDIR="$tmp_root" \
-    CODETRACER_ELIXIR_RECORDER_ROOT="$recorder_repo" \
-    CODETRACER_ELIXIR_RECORDER_BIN="$recorder_bin" \
+    CODETRACER_BEAM_RECORDER_ROOT="$recorder_repo" \
+    CODETRACER_BEAM_RECORDER_BIN="$recorder_bin" \
     PATH="$recorder_bin_dir:$PATH" \
     ERL_FLAGS="$task_ebin_arg" \
     ELIXIR_ERL_OPTIONS="$task_ebin_arg" \
@@ -194,7 +216,7 @@ cat >"$output_dir/M15-FIXTURE.md" <<'EOF'
 # Elixir Canonical UI Fixture
 
 This fixture is generated from the recorder-owned canonical Mix program with
-the real codetracer-elixir-recorder. M15 UI and VS Code smoke tests regenerate
+the real codetracer-beam-recorder. M15 UI and VS Code smoke tests regenerate
 the trace from source in CI instead of storing full trace artifacts as goldens.
 EOF
 

@@ -1,5 +1,5 @@
 {
-  description = "CodeTracer Elixir and Erlang materialized trace recorder";
+  description = "CodeTracer BEAM materialized trace recorder (Erlang and Elixir)";
 
   inputs = {
     nixos-modules.url = "github:metacraft-labs/nixos-modules";
@@ -18,12 +18,12 @@
     }:
     let
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-      mkElixirRecorderPackage =
+      mkBeamRecorderPackage =
         {
           pkgs,
         }:
         pkgs.rustPlatform.buildRustPackage {
-          pname = "codetracer-elixir-recorder";
+          pname = "codetracer-beam-recorder";
           version = cargoToml.package.version;
 
           src = ./.;
@@ -37,12 +37,15 @@
           ];
 
           meta = {
-            description = "CodeTracer Elixir and Erlang materialized trace recorder";
-            homepage = "https://github.com/metacraft-labs/codetracer-elixir-recorder";
+            description = "CodeTracer BEAM materialized trace recorder (Erlang and Elixir)";
+            homepage = "https://github.com/metacraft-labs/codetracer-beam-recorder";
             license = pkgs.lib.licenses.mit;
-            mainProgram = "codetracer-elixir-recorder";
+            mainProgram = "codetracer-beam-recorder";
           };
         };
+      # Deprecated alias retained for one release cycle so downstream consumers
+      # that still reference the Elixir-only naming continue to work.
+      mkElixirRecorderPackage = mkBeamRecorderPackage;
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
@@ -52,6 +55,8 @@
         "aarch64-darwin"
       ];
 
+      flake.lib.mkBeamRecorderPackage = mkBeamRecorderPackage;
+      # Deprecated: prefer mkBeamRecorderPackage. Retained for one release cycle.
       flake.lib.mkElixirRecorderPackage = mkElixirRecorderPackage;
 
       perSystem =
@@ -116,8 +121,10 @@
             shellHook = preCommit.shellHook;
           };
 
-          packages.codetracer-elixir-recorder = mkElixirRecorderPackage { inherit pkgs; };
-          packages.default = self'.packages.codetracer-elixir-recorder;
+          packages.codetracer-beam-recorder = mkBeamRecorderPackage { inherit pkgs; };
+          # Deprecated alias retained for one release cycle.
+          packages.codetracer-elixir-recorder = self'.packages.codetracer-beam-recorder;
+          packages.default = self'.packages.codetracer-beam-recorder;
         };
     };
 }

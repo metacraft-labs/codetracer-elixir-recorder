@@ -1,4 +1,4 @@
-defmodule CodetracerElixirRecorder.CompilerTraceCollector do
+defmodule CodetracerBeamRecorder.CompilerTraceCollector do
   @moduledoc false
 
   use GenServer
@@ -152,15 +152,15 @@ defmodule CodetracerElixirRecorder.CompilerTraceCollector do
   defp inspect_env_function({name, arity}), do: "#{name}/#{arity}"
 end
 
-defmodule CodetracerElixirRecorder.CompilerTracer do
+defmodule CodetracerBeamRecorder.CompilerTracer do
   @moduledoc false
 
   def trace(event, env) do
-    CodetracerElixirRecorder.CompilerTraceCollector.record(event, env)
+    CodetracerBeamRecorder.CompilerTraceCollector.record(event, env)
   end
 end
 
-defmodule CodetracerElixirRecorder.ElixirSourceMap do
+defmodule CodetracerBeamRecorder.ElixirSourceMap do
   @moduledoc false
 
   @runtime_modules ~w[
@@ -171,12 +171,13 @@ defmodule CodetracerElixirRecorder.ElixirSourceMap do
   ]
 
   def recorder_root do
-    System.get_env("CODETRACER_ELIXIR_RECORDER_ROOT") ||
+    System.get_env("CODETRACER_BEAM_RECORDER_ROOT") ||
+      System.get_env("CODETRACER_ELIXIR_RECORDER_ROOT") ||
       Path.expand("../..", __DIR__)
   end
 
   def default_build_dir do
-    Path.expand("_codetracer/elixir-recorder/mix")
+    Path.expand("_codetracer/beam-recorder/mix")
   end
 
   def build_mix_project(opts \\ []) do
@@ -203,11 +204,11 @@ defmodule CodetracerElixirRecorder.ElixirSourceMap do
     end
 
     trace_file = Path.join(build_dir, "compiler_traces/events.jsonl")
-    {:ok, _pid} = CodetracerElixirRecorder.CompilerTraceCollector.start_link(trace_file)
+    {:ok, _pid} = CodetracerBeamRecorder.CompilerTraceCollector.start_link(trace_file)
     old_tracers = Code.get_compiler_option(:tracers)
     old_debug_info = Code.get_compiler_option(:debug_info)
     Code.put_compiler_option(:debug_info, true)
-    Code.put_compiler_option(:tracers, [CodetracerElixirRecorder.CompilerTracer | old_tracers])
+    Code.put_compiler_option(:tracers, [CodetracerBeamRecorder.CompilerTracer | old_tracers])
 
     try do
       Mix.Task.reenable("compile")
@@ -215,7 +216,7 @@ defmodule CodetracerElixirRecorder.ElixirSourceMap do
     after
       Code.put_compiler_option(:tracers, old_tracers)
       Code.put_compiler_option(:debug_info, old_debug_info)
-      CodetracerElixirRecorder.CompilerTraceCollector.stop()
+      CodetracerBeamRecorder.CompilerTraceCollector.stop()
     end
 
     app_infos = project_apps(source_root)
@@ -361,7 +362,7 @@ defmodule CodetracerElixirRecorder.ElixirSourceMap do
         :ok
     end
 
-    Code.ensure_loaded!(CodetracerElixirRecorder.CompilerTracer)
+    Code.ensure_loaded!(CodetracerBeamRecorder.CompilerTracer)
     Code.ensure_loaded!(JasonCompat)
     :ok
   end

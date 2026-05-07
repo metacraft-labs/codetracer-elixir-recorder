@@ -14,7 +14,7 @@ use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use serde_json::Value;
 
 fn recorder_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_codetracer-elixir-recorder")
+    env!("CARGO_BIN_EXE_codetracer-beam-recorder")
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn temp_dir(label: &str) -> PathBuf {
         .expect("system clock before unix epoch")
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "codetracer-elixir-recorder-m3-{label}-{}-{nonce}",
+        "codetracer-beam-recorder-m3-{label}-{}-{nonce}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&path);
@@ -255,8 +255,10 @@ fn temp_dir(label: &str) -> PathBuf {
 
 fn clean_recorder_command() -> Command {
     let mut command = Command::new(recorder_binary());
+    command.env_remove("CODETRACER_BEAM_RECORDER_OUT_DIR");
     command.env_remove("CODETRACER_ELIXIR_RECORDER_OUT_DIR");
     command.env_remove("CODETRACER_FORMAT");
+    command.env_remove("CODETRACER_BEAM_RECORDER_DISABLED");
     command.env_remove("CODETRACER_ELIXIR_RECORDER_DISABLED");
     command
 }
@@ -309,7 +311,7 @@ fn compile_mix_task_ebin(label: &str) -> PathBuf {
     let ebin = tmp.join("codetracer-task-ebin");
     fs::create_dir_all(&ebin).expect("create Mix task ebin");
     let sources = [
-        repo_root().join("lib/codetracer_elixir_recorder/elixir_source_map.ex"),
+        repo_root().join("lib/codetracer_beam_recorder/elixir_source_map.ex"),
         repo_root().join("lib/mix/tasks/compile.codetracer.ex"),
         repo_root().join("lib/mix/tasks/codetracer.record.ex"),
     ];
@@ -531,8 +533,8 @@ fn record_mix_task_eval(
         .env("TMPDIR", tmp.to_str().unwrap())
         .env("ERL_FLAGS", &task_ebin_arg)
         .env("ELIXIR_ERL_OPTIONS", &task_ebin_arg)
-        .env("CODETRACER_ELIXIR_RECORDER_BIN", recorder_binary())
-        .env("CODETRACER_ELIXIR_RECORDER_ROOT", repo_root())
+        .env("CODETRACER_BEAM_RECORDER_BIN", recorder_binary())
+        .env("CODETRACER_BEAM_RECORDER_ROOT", repo_root())
         .output()
         .expect("run mix codetracer.record");
 
@@ -584,7 +586,7 @@ fn record_rebar3_profile(
         .args(args)
         .current_dir(&fixture_dir)
         .env("TMPDIR", tmp.to_str().unwrap())
-        .env("CODETRACER_ELIXIR_RECORDER_BIN", recorder_binary())
+        .env("CODETRACER_BEAM_RECORDER_BIN", recorder_binary())
         .output()
         .expect("run rebar3 codetracer provider");
 
@@ -5545,7 +5547,7 @@ fn e2e_cli_records_disabled_target_execution() {
         .current_dir(&elixir_fixture)
         .env("MIX_ENV", "test")
         .env("MIX_BUILD_ROOT", &mix_build_root)
-        .env("CODETRACER_ELIXIR_RECORDER_DISABLED", "true")
+        .env("CODETRACER_BEAM_RECORDER_DISABLED", "true")
         .output()
         .expect("run disabled mix target");
     assert_eq!(
@@ -5594,7 +5596,7 @@ fn e2e_cli_records_disabled_target_execution() {
             "--",
         ])
         .args(["sh", "-c", "printf shell-target; exit 17"])
-        .env("CODETRACER_ELIXIR_RECORDER_DISABLED", "true")
+        .env("CODETRACER_BEAM_RECORDER_DISABLED", "true")
         .output()
         .expect("run disabled shell target");
     assert_eq!(
@@ -5647,7 +5649,7 @@ fn e2e_cli_writes_trace_metadata_with_real_writer() {
         .unwrap_or_else(|error| panic!("read {}: {error}", trace_meta_path.display()));
     let trace_meta: Value = serde_json::from_str(&trace_meta_text).expect("trace_meta.json");
     assert_eq!(trace_meta["language"], "elixir");
-    assert_eq!(trace_meta["recorder"], "codetracer-elixir-recorder");
+    assert_eq!(trace_meta["recorder"], "codetracer-beam-recorder");
     assert_eq!(trace_meta["format"], "ctfs");
     assert_eq!(trace_meta["target"]["exit_code"], 0);
     assert_eq!(trace_meta["artifacts"]["ctfs"], "sh.ct");
@@ -5670,7 +5672,7 @@ fn e2e_cli_honors_env_vars_and_compile_instrument_aliases() {
                 "-c",
                 "printf alias-target",
             ])
-            .env("CODETRACER_ELIXIR_RECORDER_OUT_DIR", &env_out_dir)
+            .env("CODETRACER_BEAM_RECORDER_OUT_DIR", &env_out_dir)
             .env("CODETRACER_FORMAT", "json")
             .output()
             .unwrap_or_else(|error| panic!("run {subcommand} alias target: {error}"));
@@ -5679,7 +5681,7 @@ fn e2e_cli_honors_env_vars_and_compile_instrument_aliases() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "alias-target");
         assert!(
             cli_out_dir.join("trace_meta.json").is_file(),
-            "--out-dir should override CODETRACER_ELIXIR_RECORDER_OUT_DIR"
+            "--out-dir should override CODETRACER_BEAM_RECORDER_OUT_DIR"
         );
         assert!(
             !env_out_dir.join("trace_meta.json").exists(),
@@ -5837,7 +5839,7 @@ fn e2e_cli_compile_records_real_erlang_project() {
         "m11-multi:42\n"
     );
     assert!(auto_tmp
-        .join("_codetracer/elixir-recorder/standalone/standalone_build.json")
+        .join("_codetracer/beam-recorder/standalone/standalone_build.json")
         .is_file());
     let auto_reader = open_named_trace(&auto_out_dir, "erl.ct");
     let auto_call_names = reader_call_function_names(&auto_reader);

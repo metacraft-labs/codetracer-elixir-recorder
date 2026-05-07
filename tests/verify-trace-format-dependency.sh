@@ -18,15 +18,15 @@ actual_sha="$(git -C "$trace_format_dir" rev-parse HEAD)"
 
 cd "$repo_root"
 
-if [[ "${CODETRACER_ELIXIR_RECORDER_VERIFY_TRACE_FORMAT_IN_DEV_SHELL:-0}" != "1" ]] &&
+if [[ "${CODETRACER_BEAM_RECORDER_VERIFY_TRACE_FORMAT_IN_DEV_SHELL:-0}" != "1" ]] &&
   (! command -v cargo >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1); then
   if command -v direnv >/dev/null 2>&1; then
-    CODETRACER_ELIXIR_RECORDER_VERIFY_TRACE_FORMAT_IN_DEV_SHELL=1 \
+    CODETRACER_BEAM_RECORDER_VERIFY_TRACE_FORMAT_IN_DEV_SHELL=1 \
       exec direnv exec "$repo_root" bash "$0" "$@"
   fi
 
   if command -v nix >/dev/null 2>&1; then
-    CODETRACER_ELIXIR_RECORDER_VERIFY_TRACE_FORMAT_IN_DEV_SHELL=1 \
+    CODETRACER_BEAM_RECORDER_VERIFY_TRACE_FORMAT_IN_DEV_SHELL=1 \
       exec nix develop "$repo_root" --command bash "$0" "$@"
   fi
 

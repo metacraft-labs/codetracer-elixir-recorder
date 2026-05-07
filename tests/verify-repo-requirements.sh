@@ -99,8 +99,8 @@ require_text flake.nix '"x86_64-darwin"' "flake supports x86_64-darwin"
 require_text flake.nix '"aarch64-darwin"' "flake supports aarch64-darwin"
 require_text flake.nix 'devShells\.default' "flake exports devShells.\${system}.default through flake-parts"
 require_text flake.nix 'packages\.default' "flake exports packages.\${system}.default through flake-parts"
-require_text flake.nix 'packages\.codetracer-elixir-recorder' "flake exports named recorder package"
-require_text flake.nix 'mkElixirRecorderPackage' "flake exports lib.mkElixirRecorderPackage"
+require_text flake.nix 'packages\.codetracer-beam-recorder' "flake exports named recorder package"
+require_text flake.nix 'mkBeamRecorderPackage' "flake exports lib.mkBeamRecorderPackage"
 require_text flake.nix 'check-added-large-files\.enable = true;' "pre-commit includes large-file check"
 require_text flake.nix 'check-merge-conflicts\.enable = true;' "pre-commit includes merge-conflict check"
 require_text flake.nix 'entry = "just lint";' "pre-commit includes just lint hook"
@@ -132,12 +132,12 @@ require_text Justfile 'bump-version new_version:' "Justfile has bump-version rec
 require_json_sha codetracer 1cf386d69b53dd2c5bf9ec84fb87581e35404822
 require_json_sha codetracer-trace-format e4a7732a55302d19665251b829c8cb82909ac529
 
-require_text src/main.rs 'codetracer-elixir-recorder' "CLI binary identifies recorder name"
+require_text src/main.rs 'codetracer-beam-recorder' "CLI binary identifies recorder name"
 require_text src/main.rs '--out-dir' "CLI help documents --out-dir"
 require_text src/main.rs '--format' "CLI help documents --format"
-require_text src/main.rs 'CODETRACER_ELIXIR_RECORDER_OUT_DIR' "CLI documents recorder out-dir environment variable"
+require_text src/main.rs 'CODETRACER_BEAM_RECORDER_OUT_DIR' "CLI documents recorder out-dir environment variable"
 require_text src/main.rs 'CODETRACER_FORMAT' "CLI documents trace format environment variable"
-require_text src/main.rs 'CODETRACER_ELIXIR_RECORDER_DISABLED' "CLI handles disabled environment variable"
+require_text src/main.rs 'CODETRACER_BEAM_RECORDER_DISABLED' "CLI handles disabled environment variable"
 
 if [[ "$failures" -gt 0 ]]; then
   printf '\n%s compliance check(s) failed.\n' "$failures" >&2

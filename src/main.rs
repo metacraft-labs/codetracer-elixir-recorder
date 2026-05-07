@@ -20,7 +20,7 @@ use codetracer_trace_writer_nim::{
 };
 use serde::{Deserialize, Serialize};
 
-const BINARY_NAME: &str = "codetracer-elixir-recorder";
+const BINARY_NAME: &str = "codetracer-beam-recorder";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FIXTURE_PROGRAM: &str = "codetracer_elixir_m2_bridge";
 const FIXTURE_SOURCE: &str = "test-programs/elixir/canonical_flow/lib/canonical_flow.ex";
@@ -66,7 +66,7 @@ fn run() -> Result<i32, RecorderDiagnostic> {
 
 fn print_help() {
     println!(
-        "{BINARY_NAME} - CodeTracer Elixir Recorder
+        "{BINARY_NAME} - CodeTracer BEAM Recorder (Erlang and Elixir)
 
 Usage:
   {BINARY_NAME} record [OPTIONS] [--] COMMAND [ARGS...]
@@ -93,9 +93,11 @@ Options:
   -V, --version         Show recorder version
 
 Environment:
-  CODETRACER_ELIXIR_RECORDER_OUT_DIR  Output directory overridden by --out-dir
+  CODETRACER_BEAM_RECORDER_OUT_DIR    Output directory overridden by --out-dir
+                                      (legacy alias: CODETRACER_ELIXIR_RECORDER_OUT_DIR)
   CODETRACER_FORMAT                   Trace format overridden by --format
-  CODETRACER_ELIXIR_RECORDER_DISABLED Set to 1 or true to run target without recording"
+  CODETRACER_BEAM_RECORDER_DISABLED   Set to 1 or true to run target without recording
+                                      (legacy alias: CODETRACER_ELIXIR_RECORDER_DISABLED)"
     );
 }
 
@@ -168,14 +170,44 @@ fn build_command(subcommand: &'static str, args: Vec<String>) -> Result<i32, Rec
 }
 
 fn recording_disabled() -> bool {
-    env::var("CODETRACER_ELIXIR_RECORDER_DISABLED")
+    let value = match env::var("CODETRACER_BEAM_RECORDER_DISABLED") {
+        Ok(value) => Some(value),
+        Err(_) => match env::var("CODETRACER_ELIXIR_RECORDER_DISABLED") {
+            Ok(value) => {
+                eprintln!(
+                    "[codetracer-beam-recorder] note: CODETRACER_ELIXIR_RECORDER_DISABLED \
+                     is deprecated; please use CODETRACER_BEAM_RECORDER_DISABLED."
+                );
+                Some(value)
+            }
+            Err(_) => None,
+        },
+    };
+    value
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
+/// Reads the recorder output directory env var, preferring the BEAM-prefixed
+/// name and emitting a one-line stderr deprecation note when only the legacy
+/// Elixir-prefixed name is set.
+fn out_dir_env() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("CODETRACER_BEAM_RECORDER_OUT_DIR") {
+        return Some(PathBuf::from(value));
+    }
+    if let Some(value) = env::var_os("CODETRACER_ELIXIR_RECORDER_OUT_DIR") {
+        eprintln!(
+            "[codetracer-beam-recorder] note: CODETRACER_ELIXIR_RECORDER_OUT_DIR \
+             is deprecated; please use CODETRACER_BEAM_RECORDER_OUT_DIR."
+        );
+        return Some(PathBuf::from(value));
+    }
+    None
+}
+
 fn default_standalone_build_dir() -> PathBuf {
     PathBuf::from("_codetracer")
-        .join("elixir-recorder")
+        .join("beam-recorder")
         .join("standalone")
 }
 
@@ -365,7 +397,7 @@ impl PreparedTarget {
 }
 
 fn parse_record_options(args: Vec<String>) -> Result<ParsedRecordCommand, RecorderDiagnostic> {
-    let mut out_dir = env::var_os("CODETRACER_ELIXIR_RECORDER_OUT_DIR").map(PathBuf::from);
+    let mut out_dir = out_dir_env();
     let mut format = match env::var("CODETRACER_FORMAT") {
         Ok(value) => Some(OutputFormat::parse(&value)?),
         Err(_) => None,
@@ -4451,7 +4483,7 @@ fn write_fixture(args: Vec<String>) -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_fixture_options(args: Vec<String>) -> Result<FixtureOptions, Box<dyn Error>> {
-    let mut out_dir = env::var_os("CODETRACER_ELIXIR_RECORDER_OUT_DIR").map(PathBuf::from);
+    let mut out_dir = out_dir_env();
     let mut format = env::var("CODETRACER_FORMAT")
         .ok()
         .map(|value| WriterFormat::parse(&value))
@@ -4517,7 +4549,7 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
     writer.register_step(&source_path, Line(6));
     writer.register_special_event(EventLogKind::Write, "m2", "ctfs writer bridge fixture");
     writer.finish_writing_trace_events()?;
-    writer.write_meta_dat("codetracer-elixir-recorder")?;
+    writer.write_meta_dat("codetracer-beam-recorder")?;
     writer.close()?;
     drop(writer);
 

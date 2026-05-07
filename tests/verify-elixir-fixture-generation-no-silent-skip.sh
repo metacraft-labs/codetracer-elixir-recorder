@@ -40,11 +40,11 @@ cleanup() {
 trap cleanup EXIT
 
 expect_failure "missing-recorder" \
-  env CI=1 CODETRACER_ELIXIR_RECORDER_BIN="$work_dir/missing-recorder" \
+  env CI=1 CODETRACER_BEAM_RECORDER_BIN="$work_dir/missing-recorder" \
     "$script" "$work_dir/missing-recorder-out"
 
 expect_failure "missing-recorder-repo" \
-  env CI=1 CODETRACER_ELIXIR_RECORDER_PATH="$work_dir/missing-repo" \
+  env CI=1 CODETRACER_BEAM_RECORDER_PATH="$work_dir/missing-repo" \
     "$script" "$work_dir/missing-repo-out"
 
 expect_failure "missing-canonical-fixture" \

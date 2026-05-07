@@ -102,7 +102,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codetracer-elixir-recorder"
+name = "codetracer-beam-recorder"
 version = "0.1.0"
 dependencies = [
  "cbor4ii",
