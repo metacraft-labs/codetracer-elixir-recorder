@@ -3513,6 +3513,238 @@ fn e2e_elixir_protocol_macro_behaviour_matrix() {
 }
 
 #[test]
+fn e2e_elixir_reference_edge_constructs() {
+    let recorded = record_mix_task_eval(
+        "m16-elixir-reference-edges",
+        "reference_edges",
+        "ReferenceEdges.main()",
+        &[],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("reference-edges-ok:317"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    for (module, function, arity) in [
+        ("Elixir.ReferenceEdges", "main", 0),
+        ("Elixir.ReferenceEdges", "anonymous_matrix", 0),
+        ("Elixir.ReferenceEdges", "guard_matrix", 0),
+        ("Elixir.ReferenceEdges", "macro_matrix", 0),
+        ("Elixir.ReferenceEdges", "behaviour_matrix", 1),
+        ("Elixir.ReferenceEdges", "protocol_matrix", 0),
+        ("Elixir.ReferenceEdges.FullImpl", "required", 1),
+        ("Elixir.ReferenceEdges.FullImpl", "optional", 1),
+        ("Elixir.ReferenceEdges.MinimalImpl", "required", 1),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "call"
+                    && event["module"] == module
+                    && event["function"] == function
+                    && event["arity"] == arity
+                    && event["source_location"]["trace_copy_path"] == "files/lib/reference_edges.ex"
+                    && event["source_location"]["resolution"] == "source_map"
+            }),
+            "runtime sidecar should include {module}.{function}/{arity} with source-map metadata: {events:#?}"
+        );
+    }
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "Elixir.ReferenceEdges.MinimalImpl"
+                && event["function"] == "optional"
+                && event["arity"] == 1
+        }),
+        "minimal behaviour implementation should omit the optional callback: {events:#?}"
+    );
+    for module_suffix in [
+        "EdgeProtocol.Integer",
+        "EdgeProtocol.List",
+        "EdgeProtocol.BitString",
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "call"
+                    && event["module"].as_str().is_some_and(|module| {
+                        module == format!("Elixir.ReferenceEdges.{module_suffix}")
+                    })
+                    && event["function"] == "weight"
+                    && event["arity"] == 1
+            }),
+            "runtime sidecar should include built-in protocol implementation {module_suffix}.weight/1: {events:#?}"
+        );
+    }
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("anonymous_score", 76),
+        ("guard_score", 75),
+        ("macro_score", 39),
+        ("behaviour_score", 82),
+        ("protocol_score", 45),
+        ("even_clause_score", 14),
+        ("guard_clause_score", 25),
+        ("tuple_clause_score", 37),
+        ("fallback_clause_score", 0),
+        ("public_guard_score", 8),
+        ("private_guard_score", 60),
+        ("rejected_private_guard_score", 7),
+        ("private_macro_score", 29),
+        ("guarded_macro_score", 10),
+        ("full_required_score", 12),
+        ("full_optional_score", 46),
+        ("minimal_required_score", 11),
+        ("minimal_optional_score", 13),
+        ("integer_protocol_score", 13),
+        ("list_protocol_score", 12),
+        ("bitstring_protocol_score", 20),
+        ("final_total", 317),
+    ] {
+        assert_sidecar_elixir_binding(&binds, name, value);
+    }
+    assert_sidecar_elixir_raw_type_binding(&binds, "classifier", "FunctionKind", "fun");
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["sources"].as_array().is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source["trace_copy_path"] == "files/lib/reference_edges.ex")
+        }),
+        "trace metadata should expose reference_edges fixture source: {meta:#?}"
+    );
+    assert!(
+        recorded
+            .out_dir
+            .join("files/lib/reference_edges.ex")
+            .is_file(),
+        "trace bundle should copy reference_edges source"
+    );
+
+    let source_maps = source_map_jsons(&recorded.out_dir);
+    assert!(
+        source_maps.iter().any(|map| {
+            map["source_language"] == "elixir"
+                && map["original_path"]
+                    .as_str()
+                    .is_some_and(|original| original.ends_with("lib/reference_edges.ex"))
+                && map["mappings"]
+                    .as_array()
+                    .is_some_and(|mappings| !mappings.is_empty())
+        }),
+        "source-map artifacts should map generated Erlang forms back to lib/reference_edges.ex: {source_maps:#?}"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let main_manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.ReferenceEdges")
+        .unwrap_or_else(|| panic!("missing ReferenceEdges manifest: {manifests:#?}"));
+    assert!(
+        main_manifest["functions"]
+            .as_array()
+            .is_some_and(|functions| {
+                [
+                    "Elixir.ReferenceEdges.main/0",
+                    "Elixir.ReferenceEdges.anonymous_matrix/0",
+                    "Elixir.ReferenceEdges.guard_matrix/0",
+                    "Elixir.ReferenceEdges.macro_matrix/0",
+                    "Elixir.ReferenceEdges.behaviour_matrix/1",
+                    "Elixir.ReferenceEdges.protocol_matrix/0",
+                ]
+                .into_iter()
+                .all(|key| functions.iter().any(|function| function["key"] == key))
+            })
+            && main_manifest["locations"]
+                .as_array()
+                .is_some_and(|locations| {
+                    locations.iter().any(|location| {
+                        location["trace_copy_path"] == "files/lib/reference_edges.ex"
+                            && location["resolution"] == "source_map"
+                    })
+                }),
+        "ReferenceEdges manifest should expose source-mapped functions: {main_manifest:#?}"
+    );
+    for module in [
+        "Elixir.ReferenceEdges.FullImpl",
+        "Elixir.ReferenceEdges.MinimalImpl",
+        "Elixir.ReferenceEdges.EdgeProtocol.Integer",
+        "Elixir.ReferenceEdges.EdgeProtocol.List",
+        "Elixir.ReferenceEdges.EdgeProtocol.BitString",
+    ] {
+        assert!(
+            manifests.iter().any(|manifest| {
+                manifest["module"]["name"] == module
+                    && manifest["locations"].as_array().is_some_and(|locations| {
+                        locations.iter().any(|location| {
+                            location["trace_copy_path"] == "files/lib/reference_edges.ex"
+                                && location["resolution"] == "source_map"
+                        })
+                    })
+            }),
+            "manifest should expose source-mapped module {module}: {manifests:#?}"
+        );
+    }
+
+    let reader = open_named_trace(&recorded.out_dir, "mix.ct");
+    assert!(
+        reader.step_count() > 0,
+        "CTFS reader should expose reference edge steps"
+    );
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|observed| observed.ends_with("lib/reference_edges.ex")),
+        "CTFS reader paths should include lib/reference_edges.ex: {paths:#?}"
+    );
+    let function_names = reader_function_names(&reader);
+    for expected in [
+        "ReferenceEdges.main/0",
+        "ReferenceEdges.anonymous_matrix/0",
+        "ReferenceEdges.guard_matrix/0",
+        "ReferenceEdges.macro_matrix/0",
+        "ReferenceEdges.behaviour_matrix/1",
+        "ReferenceEdges.protocol_matrix/0",
+        "ReferenceEdges.FullImpl.required/1",
+        "ReferenceEdges.FullImpl.optional/1",
+        "ReferenceEdges.MinimalImpl.required/1",
+    ] {
+        assert!(
+            function_names.iter().any(|name| name == expected),
+            "CTFS reader should expose {expected}: {function_names:#?}"
+        );
+    }
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "mix.ct");
+    for (name, value) in [
+        ("anonymous_score", 76),
+        ("guard_score", 75),
+        ("macro_score", 39),
+        ("behaviour_score", 82),
+        ("protocol_score", 45),
+        ("final_total", 317),
+    ] {
+        assert_reader_elixir_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "mix.ct");
+    assert_raw_elixir_value(&values, "final_total", "final integer total", |value| {
+        matches!(value, ValueRecord::Int { i: 317, .. })
+    });
+}
+
+#[test]
 fn e2e_mix_records_umbrella_project() {
     let recorded = record_mix_task_eval(
         "m12-umbrella",
