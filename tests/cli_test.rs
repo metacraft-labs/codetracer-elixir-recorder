@@ -996,6 +996,65 @@ fn assert_sidecar_binding(binds: &[Value], name: &str, value: i64) {
     );
 }
 
+fn sidecar_binding_values<'a>(binds: &'a [Value], name: &str) -> Vec<&'a Value> {
+    binds
+        .iter()
+        .filter(|event| event["name"] == name)
+        .map(|event| &event["value"])
+        .collect()
+}
+
+fn assert_sidecar_record_binding(
+    binds: &[Value],
+    name: &str,
+    record_tag: &str,
+    field_count: usize,
+    nested_record_tag: Option<&str>,
+) {
+    let values = sidecar_binding_values(binds, name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "record"
+                && value["record_tag"] == record_tag
+                && value["fields"]
+                    .as_array()
+                    .is_some_and(|fields| fields.len() == field_count)
+                && nested_record_tag
+                    .map(|tag| sidecar_value_contains_record_tag(value, tag))
+                    .unwrap_or(true)
+        }),
+        "missing sidecar record binding {name}=#{record_tag}{{}} with {field_count} fields: {values:#?}"
+    );
+}
+
+fn sidecar_value_contains_record_tag(value: &Value, record_tag: &str) -> bool {
+    if value["kind"] == "record" && value["record_tag"] == record_tag {
+        return true;
+    }
+    match value {
+        Value::Object(map) => map
+            .values()
+            .any(|nested| sidecar_value_contains_record_tag(nested, record_tag)),
+        Value::Array(values) => values
+            .iter()
+            .any(|nested| sidecar_value_contains_record_tag(nested, record_tag)),
+        _ => false,
+    }
+}
+
+fn assert_sidecar_list_binding(binds: &[Value], name: &str, element_count: usize) {
+    let values = sidecar_binding_values(binds, name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "list"
+                && value["elements"]
+                    .as_array()
+                    .is_some_and(|elements| elements.len() == element_count)
+        }),
+        "missing sidecar list binding {name} with {element_count} elements: {values:#?}"
+    );
+}
+
 fn reader_value_pairs(out_dir: &Path, trace_file: &str) -> Vec<(String, i64)> {
     let reader = open_named_trace(out_dir, trace_file);
     let varnames = (0..reader.varname_count())
@@ -3026,6 +3085,221 @@ fn e2e_erlang_syntax_matrix_constructs() {
         find_named_value(&values, "FinalTotal"),
         ValueRecord::Int { i: 658, .. }
     ));
+}
+
+#[test]
+fn e2e_erlang_records_matrix_constructs() {
+    let recorded = record_erlang_fixture_function(
+        "m13-erlang-records-matrix",
+        "records_matrix",
+        "records_matrix",
+        "main",
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "records-matrix-ok:4431\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "records_matrix"
+                && event["function"] == "main"
+                && event["arity"] == 0
+                && event["source_location"]["trace_copy_path"] == "files/src/records_matrix.erl"
+        }),
+        "runtime sidecar should contain records_matrix:main/0 with source metadata: {events:#?}"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    assert_sidecar_record_binding(&binds, "DefaultAddress", "address", 3, None);
+    assert_sidecar_record_binding(&binds, "DefaultProfile", "profile", 5, Some("address"));
+    assert_sidecar_record_binding(&binds, "AddressUpdate", "address", 3, None);
+    assert_sidecar_record_binding(&binds, "UpdatedProfile", "profile", 5, Some("address"));
+    assert_sidecar_record_binding(&binds, "ProfileAddress", "address", 3, None);
+    assert_sidecar_record_binding(&binds, "Envelope", "envelope", 3, Some("profile"));
+    assert_sidecar_record_binding(&binds, "NestedProfile", "profile", 5, Some("address"));
+    assert_sidecar_record_binding(&binds, "NestedAddress", "address", 3, None);
+    for (name, value) in [
+        ("ProfileAge", 44),
+        ("ProfileZip", 4242),
+        ("MatchedZip", 4242),
+        ("GuardScore", 23),
+        ("PatternScore", 86),
+        ("NestedZip", 4242),
+        ("ProfileSize", 5),
+        ("AddressSize", 3),
+        ("EnvelopeSize", 3),
+        ("FieldsScore", 19),
+        ("Total", 4431),
+    ] {
+        assert_sidecar_binding(&binds, name, value);
+    }
+    assert_sidecar_list_binding(&binds, "ProfileFields", 4);
+    assert_sidecar_list_binding(&binds, "AddressFields", 2);
+    assert_sidecar_list_binding(&binds, "EnvelopeFields", 2);
+    assert!(
+        sidecar_binding_values(&binds, "ModuleMacro")
+            .iter()
+            .any(|value| value["kind"] == "atom" && value["value"] == "records_matrix")
+            && sidecar_binding_values(&binds, "LineMacro")
+                .iter()
+                .any(|value| reader_value_int(value).is_some_and(|line| line > 0))
+            && sidecar_binding_values(&binds, "IncludeTag")
+                .iter()
+                .any(|value| {
+                    value["kind"] == "atom" && value["value"] == "records_matrix_include_marker"
+                }),
+        "macro-expanded bindings should be sidecar-visible: {binds:#?}"
+    );
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    let types = raw_ctfs_low_level_types(&recorded.out_dir, "erl.ct");
+    assert!(matches!(
+        find_named_value(&values, "DefaultAddress"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 3
+    ));
+    assert!(matches!(
+        find_named_value(&values, "UpdatedProfile"),
+        ValueRecord::Struct { field_values, .. }
+            if field_values.len() == 5
+                && field_values
+                    .iter()
+                    .any(|value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 3))
+    ));
+    assert!(matches!(
+        find_named_value(&values, "Envelope"),
+        ValueRecord::Struct { field_values, .. }
+            if field_values.len() == 3
+                && field_values
+                    .iter()
+                    .any(|value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 5))
+    ));
+    assert!(matches!(
+        find_named_value(&values, "ProfileFields"),
+        ValueRecord::Sequence { elements, .. } if elements.len() == 4
+    ));
+    assert!(matches!(
+        find_named_value(&values, "ProfileSize"),
+        ValueRecord::Int { i: 5, .. }
+    ));
+    assert!(matches!(
+        find_named_value(&values, "ModuleMacro"),
+        ValueRecord::Raw { r, .. } if r == "records_matrix"
+    ));
+    assert!(matches!(
+        find_named_value(&values, "IncludeTag"),
+        ValueRecord::Raw { r, .. } if r == "records_matrix_include_marker"
+    ));
+    assert!(matches!(
+        find_named_value(&values, "LineMacro"),
+        ValueRecord::Int { i, .. } if *i > 0
+    ));
+    assert_value_type(
+        &values,
+        &types,
+        "UpdatedProfile",
+        TypeKind::Struct,
+        "record:profile",
+    );
+    assert_value_type(
+        &values,
+        &types,
+        "ProfileAddress",
+        TypeKind::Struct,
+        "record:address",
+    );
+    assert_value_type(
+        &values,
+        &types,
+        "Envelope",
+        TypeKind::Struct,
+        "record:envelope",
+    );
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["trace_copy_path"] == "files/src/records_matrix.erl"
+                    && source["build_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("src/records_matrix.erl"))
+            })
+        }),
+        "trace metadata should list copied records_matrix source: {meta:#?}"
+    );
+    assert!(
+        recorded
+            .out_dir
+            .join("files/src/records_matrix.erl")
+            .is_file(),
+        "trace bundle should contain src/records_matrix.erl"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "records_matrix")
+        .unwrap_or_else(|| panic!("missing records_matrix manifest: {manifests:#?}"));
+    assert_eq!(
+        manifest["module"]["trace_copy_path"],
+        "files/src/records_matrix.erl"
+    );
+    assert!(
+        manifest["functions"].as_array().is_some_and(|functions| {
+            [
+                "records_matrix.main/0",
+                "records_matrix.classify/1",
+                "records_matrix.pattern_score/1",
+            ]
+            .into_iter()
+            .all(|key| functions.iter().any(|function| function["key"] == key))
+        }) && manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["trace_copy_path"] == "files/src/records_matrix.erl"
+                    && location["resolution"] == "erl_anno"
+            })
+        }),
+        "records_matrix manifest should reference source functions and locations: {manifest:#?}"
+    );
+
+    let dump = transformed_dump_text(&recorded.out_dir, "src_records_matrix.erl.transformed.erl");
+    for fragment in [
+        "-record(address",
+        "-record(profile",
+        "-record(envelope",
+        "records_matrix_include_marker",
+    ] {
+        assert!(
+            dump.contains(fragment),
+            "transformed forms should expose include-expanded record/macro fragment {fragment:?}: {dump}"
+        );
+    }
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    assert!(
+        reader_function_names(&reader)
+            .iter()
+            .any(|name| name == "records_matrix:main/0"),
+        "CTFS reader should expose records_matrix:main/0"
+    );
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("src/records_matrix.erl")),
+        "CTFS reader paths should include records_matrix source: {paths:#?}"
+    );
 }
 
 #[test]
