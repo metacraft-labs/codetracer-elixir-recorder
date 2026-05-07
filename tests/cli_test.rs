@@ -1675,6 +1675,41 @@ fn assert_sidecar_elixir_string_binding(binds: &[Value], source_name: &str, text
     );
 }
 
+fn assert_sidecar_elixir_raw_binding(
+    binds: &[Value],
+    source_name: &str,
+    lang_type: &str,
+    predicate: impl Fn(&str) -> bool,
+) {
+    let values = sidecar_elixir_binding_values(binds, source_name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "raw"
+                && value["lang_type"] == lang_type
+                && value["value"].as_str().is_some_and(&predicate)
+        }),
+        "missing sidecar Elixir raw binding {source_name} with lang_type {lang_type}: {values:#?}"
+    );
+}
+
+fn assert_sidecar_elixir_raw_type_binding(
+    binds: &[Value],
+    source_name: &str,
+    type_kind: &str,
+    lang_type: &str,
+) {
+    let values = sidecar_elixir_binding_values(binds, source_name);
+    assert!(
+        values.iter().any(|value| {
+            value["kind"] == "raw"
+                && value["type_kind"] == type_kind
+                && value["lang_type"] == lang_type
+                && value["value"].as_str().is_some_and(|text| !text.is_empty())
+        }),
+        "missing sidecar Elixir raw {type_kind}/{lang_type} binding {source_name}: {values:#?}"
+    );
+}
+
 fn assert_reader_elixir_value(pairs: &[(String, i64)], source_name: &str, value: i64) {
     assert!(
         pairs.iter().any(|(observed_name, observed_value)| {
@@ -1699,6 +1734,34 @@ fn assert_raw_elixir_value(
     assert!(
         matches.iter().any(|value| predicate(value)),
         "missing raw CTFS Elixir value {source_name} matching {description}: {matches:#?}"
+    );
+}
+
+fn find_elixir_named_value<'a>(
+    values: &'a [(String, ValueRecord)],
+    source_name: &str,
+) -> &'a ValueRecord {
+    values
+        .iter()
+        .rev()
+        .find(|(observed_name, _)| normalized_elixir_variable_name(observed_name) == source_name)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("missing raw CTFS Elixir value for {source_name}: {values:#?}"))
+}
+
+fn assert_elixir_value_type(
+    values: &[(String, ValueRecord)],
+    types: &[TypeRecord],
+    source_name: &str,
+    expected_kind: TypeKind,
+    expected_lang_type: &str,
+) {
+    let value = find_elixir_named_value(values, source_name);
+    let record = type_for_value(value, types);
+    assert_eq!(
+        (record.kind, record.lang_type.as_str()),
+        (expected_kind, expected_lang_type),
+        "unexpected Elixir type for {source_name}: value={value:#?} type={record:#?}"
     );
 }
 
@@ -2846,6 +2909,316 @@ fn e2e_elixir_constructs_core_matrix() {
             .unwrap_or_else(|error| panic!("read raw CTFS {file}: {error}"));
         assert!(!payload.is_empty(), "raw CTFS {file} should be non-empty");
     }
+}
+
+#[test]
+fn e2e_elixir_values_comprehensions_matrix() {
+    let recorded = record_mix_task_eval(
+        "m14-elixir-values-comprehensions",
+        "values_comprehensions",
+        "ValuesComprehensions.main()",
+        &[],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("values-comprehensions-ok:381"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    for (function, arity) in [
+        ("main", 0),
+        ("value_matrix", 0),
+        ("list_comprehension_matrix", 0),
+        ("binary_bitstring_matrix", 0),
+        ("option_matrix", 0),
+        ("capture_matrix", 0),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "call"
+                    && event["module"] == "Elixir.ValuesComprehensions"
+                    && event["function"] == function
+                    && event["arity"] == arity
+                    && event["source_location"]["trace_copy_path"]
+                        == "files/lib/values_comprehensions.ex"
+                    && event["source_location"]["resolution"] == "source_map"
+            }),
+            "runtime sidecar should include Elixir.ValuesComprehensions.{function}/{arity} with source-map metadata: {events:#?}"
+        );
+    }
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("values_score", 44),
+        ("list_score", 124),
+        ("binary_score", 137),
+        ("options_score", 43),
+        ("capture_score", 33),
+        ("final_total", 381),
+        ("last_byte", 99),
+        ("three", 5),
+        ("five", 17),
+        ("two", 3),
+        ("reduced_sum", 16),
+        ("capture_value", 7),
+        ("capture_result", 17),
+        ("regex_bonus", 11),
+    ] {
+        assert_sidecar_elixir_binding(&binds, name, value);
+    }
+    for (name, count) in [
+        ("charlist_value", 4),
+        ("sigil_words", 2),
+        ("list_filtered", 3),
+        ("nested_pairs", 3),
+        ("map_gen_list", 2),
+        ("unique_values", 3),
+        ("capture_lengths", 2),
+        ("capture_values", 3),
+    ] {
+        assert_sidecar_elixir_list_binding(&binds, name, count);
+    }
+    for (name, text) in [
+        ("string_value", "trace"),
+        ("sigil_string", "sigiled"),
+        ("captured_string", "CT"),
+        ("prefix", "ab"),
+        ("binary_comprehension", "ACE"),
+        ("into_binary", "bcd"),
+    ] {
+        assert_sidecar_elixir_string_binding(&binds, name, text);
+    }
+    assert_sidecar_elixir_map_struct_binding(&binds, "map_value", 3);
+    assert_sidecar_elixir_map_struct_binding(&binds, "struct_value", 4);
+    assert_sidecar_elixir_map_struct_binding(&binds, "into_map", 2);
+    assert_sidecar_elixir_raw_binding(&binds, "raw_binary", "binary", |value| {
+        value == "0x00FF4105"
+    });
+    assert_sidecar_elixir_raw_binding(&binds, "raw_tail", "binary", |value| value == "0xFF4105");
+    assert_sidecar_elixir_raw_binding(&binds, "bitstring_value", "term", |value| {
+        value.starts_with("<<")
+    });
+    for name in ["remote_capture", "placeholder_capture", "mapper_capture"] {
+        assert_sidecar_elixir_raw_type_binding(&binds, name, "FunctionKind", "fun");
+    }
+
+    let meta = trace_meta(&recorded.out_dir);
+    assert!(
+        meta["sources"].as_array().is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["trace_copy_path"] == "files/lib/values_comprehensions.ex"
+                    && source["build_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("lib/values_comprehensions.ex"))
+            })
+        }),
+        "trace metadata should expose the ValuesComprehensions .ex source: {meta:#?}"
+    );
+    assert!(
+        recorded
+            .out_dir
+            .join("files/lib/values_comprehensions.ex")
+            .is_file(),
+        "trace bundle should copy lib/values_comprehensions.ex"
+    );
+
+    let source_maps = source_map_jsons(&recorded.out_dir);
+    assert!(
+        source_maps.iter().any(|map| {
+            map["source_language"] == "elixir"
+                && map["original_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("lib/values_comprehensions.ex"))
+                && map["mappings"]
+                    .as_array()
+                    .is_some_and(|mappings| !mappings.is_empty())
+        }),
+        "source-map artifacts should map generated Erlang forms back to lib/values_comprehensions.ex: {source_maps:#?}"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.ValuesComprehensions")
+        .unwrap_or_else(|| panic!("missing ValuesComprehensions manifest: {manifests:#?}"));
+    assert!(
+        manifest["functions"].as_array().is_some_and(|functions| {
+            [
+                "Elixir.ValuesComprehensions.main/0",
+                "Elixir.ValuesComprehensions.value_matrix/0",
+                "Elixir.ValuesComprehensions.list_comprehension_matrix/0",
+                "Elixir.ValuesComprehensions.binary_bitstring_matrix/0",
+                "Elixir.ValuesComprehensions.option_matrix/0",
+                "Elixir.ValuesComprehensions.capture_matrix/0",
+            ]
+            .into_iter()
+            .all(|key| functions.iter().any(|function| function["key"] == key))
+        }) && manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["trace_copy_path"] == "files/lib/values_comprehensions.ex"
+                    && location["resolution"] == "source_map"
+            })
+        }),
+        "ValuesComprehensions manifest should expose functions and .ex source-map locations: {manifest:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "mix.ct");
+    assert!(
+        reader.step_count() > 0,
+        "CTFS reader should expose ValuesComprehensions steps"
+    );
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("lib/values_comprehensions.ex")),
+        "CTFS reader paths should include lib/values_comprehensions.ex: {paths:#?}"
+    );
+    let function_names = reader_function_names(&reader);
+    assert!(
+        [
+            "ValuesComprehensions.main/0",
+            "ValuesComprehensions.value_matrix/0",
+            "ValuesComprehensions.list_comprehension_matrix/0",
+            "ValuesComprehensions.binary_bitstring_matrix/0",
+            "ValuesComprehensions.option_matrix/0",
+            "ValuesComprehensions.capture_matrix/0",
+        ]
+        .into_iter()
+        .all(|expected| function_names.iter().any(|name| name == expected)),
+        "CTFS reader should expose ValuesComprehensions functions: {function_names:#?}"
+    );
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "ValuesComprehensions.binary_bitstring_matrix/0")
+            && call_names
+                .iter()
+                .any(|name| name == "ValuesComprehensions.option_matrix/0")
+            && call_names
+                .iter()
+                .any(|name| name == "ValuesComprehensions.capture_matrix/0"),
+        "CTFS reader should expose ValuesComprehensions call records: {call_names:#?}"
+    );
+    let pairs = reader_value_pairs(&recorded.out_dir, "mix.ct");
+    for (name, value) in [
+        ("values_score", 44),
+        ("list_score", 124),
+        ("binary_score", 137),
+        ("options_score", 43),
+        ("capture_score", 33),
+        ("final_total", 381),
+    ] {
+        assert_reader_elixir_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "mix.ct");
+    let types = raw_ctfs_low_level_types(&recorded.out_dir, "mix.ct");
+    assert_raw_elixir_value(
+        &values,
+        "string_value",
+        "string binary",
+        |value| matches!(value, ValueRecord::String { text, .. } if text == "trace"),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "charlist_value",
+        "charlist sequence",
+        |value| matches!(value, ValueRecord::Sequence { elements, .. } if elements.len() == 4),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "sigil_string",
+        "sigil string",
+        |value| matches!(value, ValueRecord::String { text, .. } if text == "sigiled"),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "map_value",
+        "map value",
+        |value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 3),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "struct_value",
+        "Elixir struct value",
+        |value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 4),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "raw_binary",
+        "raw binary",
+        |value| matches!(value, ValueRecord::Raw { r, .. } if r == "0x00FF4105"),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "binary_comprehension",
+        "binary comprehension string",
+        |value| matches!(value, ValueRecord::String { text, .. } if text == "ACE"),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "bitstring_comprehension",
+        "non-byte-size bitstring comprehension",
+        |value| matches!(value, ValueRecord::Raw { r, .. } if r.starts_with("<<")),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "into_map",
+        "into map",
+        |value| matches!(value, ValueRecord::Struct { field_values, .. } if field_values.len() == 2),
+    );
+    assert_raw_elixir_value(
+        &values,
+        "into_binary",
+        "into binary",
+        |value| matches!(value, ValueRecord::String { text, .. } if text == "bcd"),
+    );
+    for name in ["remote_capture", "placeholder_capture", "mapper_capture"] {
+        assert_raw_elixir_value(&values, name, "function capture", |value| {
+            matches!(value, ValueRecord::Raw { .. })
+        });
+    }
+    assert_raw_elixir_value(&values, "final_total", "final integer total", |value| {
+        matches!(value, ValueRecord::Int { i: 381, .. })
+    });
+
+    assert_elixir_value_type(&values, &types, "string_value", TypeKind::String, "binary");
+    assert_elixir_value_type(&values, &types, "charlist_value", TypeKind::Seq, "list");
+    assert_elixir_value_type(&values, &types, "map_value", TypeKind::Struct, "map");
+    assert_elixir_value_type(&values, &types, "struct_value", TypeKind::Struct, "map");
+    assert_elixir_value_type(&values, &types, "raw_binary", TypeKind::Raw, "binary");
+    assert_elixir_value_type(
+        &values,
+        &types,
+        "binary_comprehension",
+        TypeKind::String,
+        "binary",
+    );
+    assert_elixir_value_type(
+        &values,
+        &types,
+        "remote_capture",
+        TypeKind::FunctionKind,
+        "fun",
+    );
+    assert_elixir_value_type(
+        &values,
+        &types,
+        "placeholder_capture",
+        TypeKind::FunctionKind,
+        "fun",
+    );
 }
 
 #[test]
