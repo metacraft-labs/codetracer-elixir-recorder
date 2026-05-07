@@ -413,6 +413,47 @@ fn record_erlang_canonical_function(label: &str, function: &str) -> RecordedTrac
     }
 }
 
+fn record_erlang_fixture_function(
+    label: &str,
+    fixture_name: &str,
+    module: &str,
+    function: &str,
+) -> RecordedTrace {
+    let tmp = temp_dir(label);
+    let out_dir = tmp.join("trace");
+    let fixture_dir = repo_root().join("test-programs/erlang").join(fixture_name);
+    let ebin_dir = tmp.join("erlang-ebin");
+    compile_erlang_sources(&fixture_dir.join("src"), &ebin_dir);
+
+    let output = clean_recorder_command()
+        .args([
+            "record",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--",
+            "erl",
+            "-noshell",
+            "-pa",
+            ebin_dir.to_str().unwrap(),
+            "-s",
+            module,
+            function,
+            "-s",
+            "init",
+            "stop",
+        ])
+        .current_dir(&fixture_dir)
+        .env("TMPDIR", tmp.to_str().unwrap())
+        .output()
+        .expect("run Erlang fixture under runtime session");
+
+    RecordedTrace {
+        out_dir,
+        build_dir: None,
+        output,
+    }
+}
+
 fn record_erlang_spawn_function(label: &str, function: &str) -> RecordedTrace {
     let tmp = temp_dir(label);
     let out_dir = tmp.join("trace");
@@ -2886,6 +2927,105 @@ fn e2e_pattern_clause_selection_bindings() {
     for (name, value) in [("N", 7), ("Quotient", 5), ("C", 11), ("X", 4)] {
         assert_reader_value(&pairs, name, value);
     }
+}
+
+#[test]
+fn e2e_erlang_syntax_matrix_constructs() {
+    let recorded = record_erlang_fixture_function(
+        "m13-erlang-syntax-matrix",
+        "syntax_matrix",
+        "syntax_matrix",
+        "main",
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "syntax-matrix-ok:658\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "syntax_matrix"
+                && event["function"] == "main"
+                && event["arity"] == 0
+        }),
+        "runtime sidecar should contain the syntax_matrix:main/0 call: {events:#?}"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("Head", 9),
+        ("ListScore", 13),
+        ("MapLeft", 21),
+        ("MapRight", 22),
+        ("MapTotal", 43),
+        ("ByteA", 255),
+        ("ByteB", 22),
+        ("Wide", 43),
+        ("CompareScore", 3),
+        ("BitScore", 38),
+        ("BoolScore", 3),
+        ("ImportedTotal", 43),
+        ("Applied", 44),
+        ("LocalFunResult", 40),
+        ("RemoteFunResult", 4),
+        ("ClosureResult", 15),
+        ("MultiResult", 26),
+        ("BeginResult", 44),
+        ("MaybeScore", 17),
+        ("MaybeElse", 5),
+        ("FinalTotal", 658),
+    ] {
+        assert_sidecar_binding(&binds, name, value);
+    }
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    assert!(
+        reader.step_count() > 0,
+        "reader should expose syntax-matrix steps"
+    );
+    let function_names = reader_function_names(&reader);
+    assert!(
+        function_names
+            .iter()
+            .any(|name| name == "syntax_matrix:main/0"),
+        "CTFS reader should expose syntax_matrix:main/0: {function_names:#?}"
+    );
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "erl.ct");
+    for (name, value) in [
+        ("BitScore", 38),
+        ("BoolScore", 3),
+        ("MaybeScore", 17),
+        ("FinalTotal", 658),
+    ] {
+        assert_reader_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    assert!(matches!(
+        find_named_value(&values, "Diff"),
+        ValueRecord::Sequence { elements, .. } if elements.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "UpdatedMap"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 3
+    ));
+    assert!(matches!(
+        find_named_value(&values, "Packed"),
+        ValueRecord::Raw { r, .. } if r.starts_with("0xFF16002B")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "FinalTotal"),
+        ValueRecord::Int { i: 658, .. }
+    ));
 }
 
 #[test]
