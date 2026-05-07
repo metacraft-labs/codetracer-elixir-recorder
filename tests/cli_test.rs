@@ -17,6 +17,224 @@ fn recorder_binary() -> &'static str {
     env!("CARGO_BIN_EXE_codetracer-elixir-recorder")
 }
 
+#[test]
+fn e2e_elixir_exception_flow_matrix() {
+    let recorded = record_mix_task_eval(
+        "m13-elixir-exception-flow",
+        "exception_flow",
+        "ExceptionFlow.main()",
+        &[],
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.output.stdout).contains("exception-flow-ok:228"),
+        "{}",
+        output_text(&recorded.output)
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    for (function, arity) in [
+        ("main", 0),
+        ("rescue_matrix", 1),
+        ("throw_matrix", 1),
+        ("exit_matrix", 1),
+        ("else_after_matrix", 1),
+        ("implicit_body_rescue", 1),
+        ("reraise_matrix", 1),
+        ("raise_argument", 1),
+        ("throw_value", 1),
+        ("exit_value", 1),
+        ("raise_implicit", 1),
+        ("raise_reraised", 1),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "call"
+                    && event["module"] == "Elixir.ExceptionFlow"
+                    && event["function"] == function
+                    && event["arity"] == arity
+                    && event["source_location"]["trace_copy_path"]
+                        == "files/lib/exception_flow.ex"
+                    && event["source_location"]["resolution"] == "source_map"
+            }),
+            "runtime sidecar should include Elixir.ExceptionFlow.{function}/{arity} with source-map metadata: {events:#?}"
+        );
+    }
+    for (function, class, reason) in [
+        ("raise_argument", "error", "bad 3"),
+        ("throw_value", "throw", "{thrown,4}"),
+        ("exit_value", "exit", "{exit_reason,5}"),
+        ("raise_implicit", "error", "implicit 7"),
+        ("raise_reraised", "error", "reraised 8"),
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event["event"] == "exception_from"
+                    && event["module"] == "Elixir.ExceptionFlow"
+                    && event["function"] == function
+                    && event["class"] == class
+                    && event["reason_repr"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(reason))
+            }),
+            "sidecar should expose exception_from for {function}/1 {class}:{reason}: {events:#?}"
+        );
+    }
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("rescue_score", 10),
+        ("stacktrace_score", 13),
+        ("throw_score", 20),
+        ("exit_score", 30),
+        ("else_score", 40),
+        ("implicit_score", 50),
+        ("reraise_score", 60),
+        ("after_score", 5),
+        ("final_total", 228),
+    ] {
+        assert_sidecar_elixir_binding(&binds, name, value);
+    }
+
+    let source_maps = source_map_jsons(&recorded.out_dir);
+    assert!(
+        source_maps.iter().any(|map| {
+            map["source_language"] == "elixir"
+                && map["original_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("lib/exception_flow.ex"))
+                && map["mappings"]
+                    .as_array()
+                    .is_some_and(|mappings| !mappings.is_empty())
+        }),
+        "source-map artifacts should map generated Erlang forms back to lib/exception_flow.ex: {source_maps:#?}"
+    );
+
+    let manifests = manifest_jsons(&recorded.out_dir);
+    let manifest = manifests
+        .iter()
+        .find(|manifest| manifest["module"]["name"] == "Elixir.ExceptionFlow")
+        .unwrap_or_else(|| panic!("missing ExceptionFlow manifest: {manifests:#?}"));
+    assert!(
+        manifest["functions"].as_array().is_some_and(|functions| {
+            [
+                "Elixir.ExceptionFlow.main/0",
+                "Elixir.ExceptionFlow.rescue_matrix/1",
+                "Elixir.ExceptionFlow.throw_matrix/1",
+                "Elixir.ExceptionFlow.exit_matrix/1",
+                "Elixir.ExceptionFlow.else_after_matrix/1",
+                "Elixir.ExceptionFlow.implicit_body_rescue/1",
+                "Elixir.ExceptionFlow.reraise_matrix/1",
+            ]
+            .into_iter()
+            .all(|key| functions.iter().any(|function| function["key"] == key))
+        }) && manifest["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["trace_copy_path"] == "files/lib/exception_flow.ex"
+                    && location["resolution"] == "source_map"
+            })
+        }),
+        "ExceptionFlow manifest should expose functions and .ex source-map locations: {manifest:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "mix.ct");
+    assert!(
+        reader.step_count() > 0,
+        "CTFS reader should expose ExceptionFlow steps"
+    );
+    let paths = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("reader path"))
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("lib/exception_flow.ex")),
+        "CTFS reader paths should include lib/exception_flow.ex: {paths:#?}"
+    );
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "ExceptionFlow.raise_argument/1")
+            && call_names
+                .iter()
+                .any(|name| name == "ExceptionFlow.throw_value/1")
+            && call_names
+                .iter()
+                .any(|name| name == "ExceptionFlow.exit_value/1")
+            && call_names
+                .iter()
+                .any(|name| name == "ExceptionFlow.reraise_matrix/1"),
+        "CTFS reader should expose exception-flow call records: {call_names:#?}"
+    );
+
+    let event_payloads = (0..reader.event_count())
+        .map(|index| {
+            decode_reader_event_content(&reader.event_json(index).expect("read event json"))
+        })
+        .collect::<Vec<_>>();
+    for reason in ["bad 3", "thrown", "exit_reason", "implicit 7", "reraised 8"] {
+        assert!(
+            event_payloads.iter().any(|payload| {
+                payload.contains("codetracer.elixir.exception_from.v1")
+                    && payload.contains("Elixir.ExceptionFlow")
+                    && payload.contains(reason)
+            }),
+            "CTFS reader should expose exception_from event for {reason}: {event_payloads:#?}"
+        );
+    }
+    assert!(
+        event_payloads.iter().any(|payload| {
+            payload.contains("codetracer.beam.variable-binding.v1")
+                && payload.contains("_final_total@")
+        }) && event_payloads.iter().any(|payload| {
+            payload.contains("codetracer.beam.source-location.v1")
+                && payload.contains("Elixir.ExceptionFlow")
+        }),
+        "CTFS reader should expose TraceLogEvent payloads for variable bindings and source locations: {event_payloads:#?}"
+    );
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "mix.ct");
+    for (name, value) in [
+        ("rescue_score", 10),
+        ("stacktrace_score", 13),
+        ("throw_score", 20),
+        ("exit_score", 30),
+        ("else_score", 40),
+        ("implicit_score", 50),
+        ("reraise_score", 60),
+        ("after_score", 5),
+        ("final_total", 228),
+    ] {
+        assert_reader_elixir_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "mix.ct");
+    for (name, value) in [
+        ("rescue_score", 10),
+        ("stacktrace_score", 13),
+        ("throw_score", 20),
+        ("exit_score", 30),
+        ("else_score", 40),
+        ("implicit_score", 50),
+        ("reraise_score", 60),
+        ("after_score", 5),
+        ("final_total", 228),
+    ] {
+        assert_raw_elixir_value(
+            &values,
+            name,
+            &format!("{value} integer"),
+            |record| matches!(record, ValueRecord::Int { i, .. } if *i == value),
+        );
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
