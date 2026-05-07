@@ -114,8 +114,8 @@ fi
 
 if [[ -d "$output_dir" && "${FORCE:-0}" != "1" && -z "${CI:-}" ]]; then
   if [[ -f "$output_dir/trace_metadata.json" ]] &&
-     [[ -f "$output_dir/trace_paths.json" ]] &&
-     find "$output_dir" -maxdepth 1 -name '*.ct' -type f | grep -q .; then
+    [[ -f "$output_dir/trace_paths.json" ]] &&
+    find "$output_dir" -maxdepth 1 -name '*.ct' -type f | grep -q .; then
     printf 'Elixir fixture already exists at %s; set FORCE=1 to regenerate.\n' "$output_dir"
     exit 0
   fi
@@ -170,10 +170,10 @@ printf 'Recording canonical Elixir fixture from %s\n' "$canonical_project"
     ERL_FLAGS="$task_ebin_arg" \
     ELIXIR_ERL_OPTIONS="$task_ebin_arg" \
     mix codetracer.record \
-      --build-dir "$build_dir" \
-      --out-dir "$output_dir" \
-      --include-module Elixir.CanonicalFlow \
-      --eval 'CanonicalFlow.main()'
+    --build-dir "$build_dir" \
+    --out-dir "$output_dir" \
+    --include-module Elixir.CanonicalFlow \
+    --eval 'CanonicalFlow.main()'
 )
 
 canonical_source="$canonical_project/lib/canonical_flow.ex"

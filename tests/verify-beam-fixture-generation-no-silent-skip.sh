@@ -67,18 +67,18 @@ trap cleanup EXIT
 
 expect_failure "missing-recorder-bin" \
   env CI=1 CODETRACER_BEAM_RECORDER_BIN="$work_dir/missing-recorder-bin" \
-    "$script" "$work_dir/missing-bin-elixir-out" "$work_dir/missing-bin-erlang-out"
+  "$script" "$work_dir/missing-bin-elixir-out" "$work_dir/missing-bin-erlang-out"
 
 expect_failure "missing-recorder-repo" \
   env CI=1 CODETRACER_BEAM_RECORDER_PATH="$work_dir/missing-repo" \
-    "$script" "$work_dir/missing-repo-elixir-out" "$work_dir/missing-repo-erlang-out"
+  "$script" "$work_dir/missing-repo-elixir-out" "$work_dir/missing-repo-erlang-out"
 
 expect_failure "missing-elixir-fixture" \
   env CI=1 CODETRACER_ELIXIR_FLOW_TEST="$work_dir/missing-elixir-canonical-flow" \
-    "$script" "$work_dir/missing-elixir-fixture-out" "$work_dir/erlang-out"
+  "$script" "$work_dir/missing-elixir-fixture-out" "$work_dir/erlang-out"
 
 expect_failure "missing-erlang-fixture" \
   env CI=1 CODETRACER_ERLANG_FLOW_TEST="$work_dir/missing-erlang-canonical-flow" \
-    "$script" "$work_dir/elixir-out" "$work_dir/missing-erlang-fixture-out"
+  "$script" "$work_dir/elixir-out" "$work_dir/missing-erlang-fixture-out"
 
 printf 'PASS: verify_beam_fixture_generation_no_silent_skip\n'

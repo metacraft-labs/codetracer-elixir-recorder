@@ -293,8 +293,8 @@ record_erlang() {
 
   if [[ -d "$erlang_out_dir" && "${FORCE:-0}" != "1" && -z "${CI:-}" ]]; then
     if [[ -f "$erlang_out_dir/trace_metadata.json" ]] &&
-       [[ -f "$erlang_out_dir/trace_paths.json" ]] &&
-       find "$erlang_out_dir" -maxdepth 1 -name '*.ct' -type f | grep -q .; then
+      [[ -f "$erlang_out_dir/trace_paths.json" ]] &&
+      find "$erlang_out_dir" -maxdepth 1 -name '*.ct' -type f | grep -q .; then
       printf '[codetracer-beam-recorder] Erlang fixture already exists at %s; set FORCE=1 to regenerate.\n' "$erlang_out_dir"
       return
     fi

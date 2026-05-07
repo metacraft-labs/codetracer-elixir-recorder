@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: test
+    name: test (nix dev shell)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,3 +59,80 @@ jobs:
         with:
           name: nix-build-logs
           path: logs/
+
+  release-check:
+    name: release-check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Run release-check
+        run: nix develop --command bash -c 'mkdir -p logs && just release-check 2>&1 | tee logs/release-check.log'
+      - name: Upload full logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-check-logs
+          path: logs/
+
+  # M17 OTP/Elixir compatibility matrix. Runs the recorder integration
+  # suite under each supported (OTP, Elixir) pair against the OS-provided
+  # toolchain (no Nix dev shell). The Nix dev shell remains the canonical
+  # build environment (`test`, `lint`, `nix-build`, `release-check`); the
+  # matrix below confirms the recorder also runs under upstream Hex /
+  # Erlang Solutions toolchains so a Hex consumer is not surprised.
+  #
+  # Matrix selection rationale:
+  #   * OTP 26 + Elixir 1.16 — the floor we ship Hex package metadata
+  #     for (mix.exs declares `elixir: "~> 1.15"` and Elixir 1.15 was
+  #     EOL'd before this milestone; 1.16 is the practical floor).
+  #   * OTP 27 + Elixir 1.17 — current stable upstream pair.
+  #
+  # macOS coverage is documented in CHANGELOG.md as deferred follow-up;
+  # the GitHub-hosted macOS runners require erlang-via-Homebrew bring-up
+  # that is out of scope for the M17 release-hardening cut. The Linux
+  # matrix below is the v1 ecosystem coverage baseline.
+  ecosystem-matrix:
+    name: matrix (otp ${{ matrix.otp }} / elixir ${{ matrix.elixir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - otp: "26.2"
+            elixir: "1.16.3"
+          - otp: "27.1"
+            elixir: "1.17.3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+      - uses: extractions/setup-just@v2
+      - name: Install zstd + capnproto + jq + shellcheck + shfmt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd libzstd-dev capnproto pkg-config jq shellcheck
+          # shfmt installed via go binary cache; not strictly needed for
+          # the matrix run since `just lint` is covered by the dedicated
+          # `lint` job above.
+      - name: Build recorder + rebar3 plugin
+        run: just build
+      - name: Run integration tests under OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }}
+        run: just test-integration
+      - name: Upload matrix logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-logs-otp${{ matrix.otp }}-elixir${{ matrix.elixir }}
+          path: |
+            target/debug/codetracer-beam-recorder
+            tests/

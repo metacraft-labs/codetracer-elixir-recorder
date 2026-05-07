@@ -41,14 +41,14 @@ trap cleanup EXIT
 
 expect_failure "missing-recorder" \
   env CI=1 CODETRACER_BEAM_RECORDER_BIN="$work_dir/missing-recorder" \
-    "$script" "$work_dir/missing-recorder-out"
+  "$script" "$work_dir/missing-recorder-out"
 
 expect_failure "missing-recorder-repo" \
   env CI=1 CODETRACER_BEAM_RECORDER_PATH="$work_dir/missing-repo" \
-    "$script" "$work_dir/missing-repo-out"
+  "$script" "$work_dir/missing-repo-out"
 
 expect_failure "missing-canonical-fixture" \
   env CI=1 CODETRACER_ELIXIR_FLOW_TEST="$work_dir/missing-canonical-flow" \
-    "$script" "$work_dir/missing-fixture-out"
+  "$script" "$work_dir/missing-fixture-out"
 
 printf 'PASS: verify_elixir_fixture_generation_no_silent_skip\n'

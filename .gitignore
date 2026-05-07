@@ -3,8 +3,12 @@
 /result-*
 /.direnv/
 /.pre-commit-config.yaml
+/_build/
+/erl_crash.dump
 rebar3_codetracer/_build/
 test-programs/erlang/**/_build/
 test-programs/erlang/**/_checkouts/
 test-programs/erlang/**/ct-traces/
 test-programs/erlang/**/ct-traces-*/
+test-programs/elixir/**/_build/
+test-programs/elixir/**/erl_crash.dump

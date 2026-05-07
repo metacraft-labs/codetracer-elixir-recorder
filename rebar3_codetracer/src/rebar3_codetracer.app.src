@@ -1,7 +1,11 @@
 {application, rebar3_codetracer,
- [{description, "CodeTracer Rebar3 integration provider"},
+ [{description, "CodeTracer Rebar3 integration provider — records Rebar3 projects into CodeTracer CTFS trace bundles"},
   {vsn, "0.1.0"},
   {registered, []},
   {applications, [kernel, stdlib]},
   {env, []},
-  {modules, []}]}.
+  {modules, []},
+  {licenses, ["MIT"]},
+  {links, [{"GitHub", "https://github.com/metacraft-labs/codetracer-beam-recorder"},
+           {"CHANGELOG", "https://github.com/metacraft-labs/codetracer-beam-recorder/blob/main/CHANGELOG.md"}]},
+  {maintainers, ["Metacraft Labs"]}]}.
