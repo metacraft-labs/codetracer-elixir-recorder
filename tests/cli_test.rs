@@ -4460,6 +4460,152 @@ fn e2e_erlang_syntax_matrix_constructs() {
 }
 
 #[test]
+fn e2e_erlang_reference_edge_constructs() {
+    let recorded = record_erlang_fixture_function(
+        "m13-erlang-reference-edges",
+        "reference_edges",
+        "reference_edges",
+        "main",
+    );
+    assert_eq!(
+        recorded.output.status.code(),
+        Some(0),
+        "{}",
+        output_text(&recorded.output)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.output.stdout),
+        "reference-edges-ok:721\n"
+    );
+
+    let events = runtime_sidecar_events(&recorded.out_dir);
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "call"
+                && event["module"] == "reference_edges"
+                && event["function"] == "main"
+                && event["arity"] == 0
+                && event["source_location"]["trace_copy_path"] == "files/src/reference_edges.erl"
+        }),
+        "runtime sidecar should contain reference_edges:main/0 with source metadata: {events:#?}"
+    );
+
+    let binds = sidecar_variable_binds(&recorded.out_dir);
+    for (name, value) in [
+        ("Id", 7),
+        ("Matched", 41),
+        ("Static", 2),
+        ("ExtraValue", 5),
+        ("MapScore", 51),
+        ("PayloadSize", 9),
+        ("BitsSize", 8),
+        ("SegmentSize", 9),
+        ("Little", 513),
+        ("Signed", -3),
+        ("Tiny", 5),
+        ("PrefixScore", 66),
+        ("Inner", 23),
+        ("OrderedValue", 19),
+        ("PatternScore", 46),
+        ("FinalTotal", 721),
+    ] {
+        assert_sidecar_binding(&binds, name, value);
+    }
+    assert!(
+        sidecar_binding_values(&binds, "CreatedMap")
+            .iter()
+            .any(|value| {
+                value["kind"] == "raw"
+                    && value["lang_type"] == "map"
+                    && value["value"].as_str().is_some_and(|raw| {
+                        raw.contains("static => 2")
+                            && raw.contains("{<<109,101,116,114,105,99>>,7} => 40")
+                    })
+            }),
+        "dynamic-key map creation should be sidecar-visible: {binds:#?}"
+    );
+    assert!(
+        sidecar_binding_values(&binds, "UpdatedMap")
+            .iter()
+            .any(|value| {
+                value["kind"] == "raw"
+                    && value["lang_type"] == "map"
+                    && value["value"].as_str().is_some_and(|raw| {
+                        raw.contains("{extra,7} => 5")
+                            && raw.contains("{<<109,101,116,114,105,99>>,7} => 41")
+                    })
+            }),
+        "dynamic-key map update should be sidecar-visible: {binds:#?}"
+    );
+    assert!(
+        sidecar_binding_values(&binds, "TypedBinary")
+            .iter()
+            .any(|value| {
+                value["kind"] == "raw"
+                    && value["lang_type"] == "binary"
+                    && value["value"]
+                        .as_str()
+                        .is_some_and(|raw| raw.starts_with("0x096D6574616372616674"))
+            }),
+        "typed dynamic binary should be sidecar-visible: {binds:#?}"
+    );
+    assert!(
+        sidecar_binding_values(&binds, "Path")
+            .iter()
+            .any(|value| value["kind"] == "string" && value["value"] == "/edge"),
+        "string-prefix binary match should expose Path as a binary string: {binds:#?}"
+    );
+
+    let reader = open_named_trace(&recorded.out_dir, "erl.ct");
+    assert!(
+        reader.step_count() > 0,
+        "reader should expose reference-edge steps"
+    );
+    let call_names = reader_call_function_names(&reader);
+    assert!(
+        call_names
+            .iter()
+            .any(|name| name == "reference_edges:main/0"),
+        "CTFS reader should expose reference_edges:main/0 call records: {call_names:#?}"
+    );
+
+    let pairs = reader_value_pairs(&recorded.out_dir, "erl.ct");
+    for (name, value) in [
+        ("MapScore", 51),
+        ("BinaryScore", 558),
+        ("PrefixScore", 66),
+        ("PatternScore", 46),
+        ("FinalTotal", 721),
+    ] {
+        assert_reader_value(&pairs, name, value);
+    }
+
+    let values = raw_ctfs_low_level_values(&recorded.out_dir, "erl.ct");
+    assert!(matches!(
+        find_named_value(&values, "UpdatedMap"),
+        ValueRecord::Raw { r, .. }
+            if r.contains("{extra,7} => 5")
+                && r.contains("{<<109,101,116,114,105,99>>,7} => 41")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "TypedBinary"),
+        ValueRecord::Raw { r, .. } if r.starts_with("0x096D6574616372616674")
+    ));
+    assert!(matches!(
+        find_named_value(&values, "PathAndVersion"),
+        ValueRecord::String { text, .. } if text == "/edge HTTP/1.1"
+    ));
+    assert!(matches!(
+        find_named_value(&values, "Shared"),
+        ValueRecord::Struct { field_values, .. } if field_values.len() == 2
+    ));
+    assert!(matches!(
+        find_named_value(&values, "FinalTotal"),
+        ValueRecord::Int { i: 721, .. }
+    ));
+}
+
+#[test]
 fn e2e_erlang_comprehension_matrix_constructs() {
     let recorded = record_erlang_fixture_function(
         "m13-erlang-comprehension-matrix",
