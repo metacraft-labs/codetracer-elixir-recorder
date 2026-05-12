@@ -1,6 +1,6 @@
 # M16 Native Tracer Benchmark Baseline
 
-Captured: 2026-05-07T21:46:21.800451Z
+Captured: 2026-05-12T07:00:11.464170Z
 
 Recorder: codetracer-beam-recorder, --tracer-backend {process|native}.
 Workloads exercise the three M16 pressure axes against real BEAM
@@ -8,12 +8,12 @@ targets via `erl -s native_tracer_bench <entry>`.
 
 | fixture | backend | wall_us | event_count | sidecar_bytes |
 | --- | --- | ---: | ---: | ---: |
-| call_heavy | process | 1819804 | 14 | 7999 |
-| call_heavy | native | 2503829 | 14 | 7449 |
-| process_heavy | process | 2841288 | 1869 | 674616 |
-| process_heavy | native | 2611956 | 1934 | 774544 |
-| message_heavy | process | 1655227 | 2028 | 630157 |
-| message_heavy | native | 2565428 | 2028 | 699019 |
+| call_heavy | process | 1492497 | 14 | 7884 |
+| call_heavy | native | 1448238 | 14 | 7417 |
+| process_heavy | process | 1465619 | 1942 | 713040 |
+| process_heavy | native | 1569187 | 1954 | 785773 |
+| message_heavy | process | 1438380 | 2032 | 632173 |
+| message_heavy | native | 1516944 | 2030 | 700121 |
 
 Notes:
 - Wall-clock time is for the *whole record + target run*, including
