@@ -1011,9 +1011,7 @@ impl RecordingSession {
                 "failed to read current directory: {error}"
             ))
         })?;
-        let metadata_path = self.out_dir.join("trace_metadata.json");
         let events_path = self.out_dir.join("trace.json");
-        let paths_path = self.out_dir.join("trace_paths.json");
         let source_path = self
             .runtime
             .source_paths
@@ -1032,19 +1030,7 @@ impl RecordingSession {
 
         self.writer.set_workdir(&current_dir);
         self.writer
-            .begin_writing_trace_metadata(&metadata_path)
-            .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?;
-        self.writer
-            .finish_writing_trace_metadata()
-            .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?;
-        self.writer
             .begin_writing_trace_events(&events_path)
-            .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?;
-        self.writer
-            .begin_writing_trace_paths(&paths_path)
-            .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?;
-        self.writer
-            .finish_writing_trace_paths()
             .map_err(|error| RecorderDiagnostic::writer_initialization_failed(error.to_string()))?;
         self.writer.start(&source_path, Line(1));
 
@@ -4512,8 +4498,6 @@ struct CompatibilityTarget<'a> {
 #[derive(Serialize)]
 struct CompatibilityArtifacts {
     ctfs: String,
-    trace_metadata: &'static str,
-    trace_paths: &'static str,
 }
 
 #[derive(Serialize)]
@@ -4554,8 +4538,6 @@ fn write_trace_meta_json(
         },
         artifacts: CompatibilityArtifacts {
             ctfs: format!("{}.ct", session.program_name),
-            trace_metadata: "trace_metadata.json",
-            trace_paths: "trace_paths.json",
         },
         runtime_session: CompatibilityRuntimeSession {
             mode: match session.runtime.mode {
@@ -4645,17 +4627,11 @@ struct FixtureSummary {
 
 fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> {
     let source_path = fixture_source_path();
-    let metadata_path = out_dir.join("trace_metadata.json");
     let events_path = out_dir.join("trace.json");
-    let paths_path = out_dir.join("trace_paths.json");
 
     let mut writer = NimTraceWriter::new(FIXTURE_PROGRAM, NimFormat::Ctfs);
     writer.set_workdir(&env::current_dir()?);
-    writer.begin_writing_trace_metadata(&metadata_path)?;
-    writer.finish_writing_trace_metadata()?;
     writer.begin_writing_trace_events(&events_path)?;
-    writer.begin_writing_trace_paths(&paths_path)?;
-    writer.finish_writing_trace_paths()?;
     writer.start(&source_path, Line(1));
     writer.register_step(&source_path, Line(5));
     writer.register_step(&source_path, Line(6));
