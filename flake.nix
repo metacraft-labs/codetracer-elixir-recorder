@@ -109,6 +109,7 @@
                 jq
                 nixfmt
                 pkg-config
+                prek
                 rebar3
                 rustc
                 rustfmt
