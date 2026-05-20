@@ -316,8 +316,119 @@ fn run_target(target: &[String]) -> Result<ExitStatus, RecorderDiagnostic> {
     run_prepared_target(&prepared)
 }
 
+/// Resolve a bare target command name (`mix`, `erl`, `rebar3`, …) to a
+/// concrete executable path, honoring Windows executable extensions.
+///
+/// The OS process launcher behind `Command::new` only appends `.exe` on
+/// Windows — it will not find `mix.bat` / `mix.cmd` (the form the Elixir
+/// and rebar3 installers ship). Searching `PATHEXT` ourselves lets the
+/// BEAM target launch uniformly on Windows and Unix. The real Windows
+/// executable extensions are tried before the bare name so a launcher
+/// directory that ships both a Unix shell script and a `.bat` resolves
+/// to the `.bat`. Returns `None` when nothing matches, in which case the
+/// caller falls back to the bare name (and any inherited launcher logic).
+fn resolve_target_command(program: &str) -> Option<PathBuf> {
+    // An explicit path is used verbatim.
+    if program.contains('/') || program.contains('\\') {
+        let p = PathBuf::from(program);
+        return p.is_file().then_some(p);
+    }
+
+    #[cfg(windows)]
+    let exts: Vec<String> = {
+        let raw = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        raw.split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .chain(std::iter::once(String::new()))
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let exts: Vec<String> = vec![String::new()];
+
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Returns `true` for a Windows batch launcher (`.bat` / `.cmd`).
+fn is_windows_batch(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("bat") | Some("cmd")
+    )
+}
+
+/// Quote one token for `cmd.exe`'s command-line parser.
+///
+/// `cmd /c` re-tokenizes its tail itself, so each token must be wrapped
+/// so embedded spaces, parentheses, `&`, `|`, `^`, etc. (all present in
+/// the BEAM `-e <elixir expr>` payload) are treated literally. Wrapping
+/// in double quotes makes `cmd` keep the token whole; inside quotes only
+/// `"` and `%` need care — `"` is doubled and `%` cannot appear in our
+/// generated expressions, so a plain quote-wrap is sufficient here.
+#[cfg(windows)]
+fn cmd_quote(token: &str) -> String {
+    format!("\"{}\"", token.replace('"', "\"\""))
+}
+
+#[cfg(windows)]
+fn run_batch_via_cmd(
+    batch: &Path,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<ExitStatus, std::io::Error> {
+    use std::os::windows::process::CommandExt;
+
+    // `cmd /c "<line>"`: cmd strips the single outer pair of quotes and
+    // executes the remainder verbatim. Build that remainder ourselves
+    // with `raw_arg` so Rust's own argument quoting (and its >=1.77
+    // batch-file argument validator) does not interfere.
+    let mut line = String::from("/c \"");
+    line.push_str(&cmd_quote(&batch.display().to_string()));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&cmd_quote(arg));
+    }
+    line.push('"');
+
+    Command::new("cmd")
+        .raw_arg(&line)
+        .envs(envs.iter().map(|(k, v)| (k, v)))
+        .status()
+}
+
 fn run_prepared_target(target: &PreparedTarget) -> Result<ExitStatus, RecorderDiagnostic> {
-    let mut command = Command::new(&target.command);
+    // Resolve `.bat`/`.cmd` launchers (`mix`, `rebar3`, …) the OS process
+    // launcher would otherwise miss on Windows.
+    let resolved = resolve_target_command(&target.command);
+
+    #[cfg(windows)]
+    if let Some(path) = resolved.as_deref() {
+        if is_windows_batch(path) {
+            // Rust >= 1.77 refuses to launch a `.bat`/`.cmd` directly when
+            // an argument contains characters its CVE-2024-24576 validator
+            // deems unsafe (the BEAM `-e <elixir expr>` payload trips
+            // this). Route batch launchers through `cmd /c` with a
+            // hand-built, cmd-quoted command line so the expression
+            // survives cmd's re-tokenization intact.
+            return run_batch_via_cmd(path, &target.args, &target.env)
+                .map_err(|error| RecorderDiagnostic::target_spawn_failed(&target.command, error));
+        }
+    }
+
+    let program: &std::ffi::OsStr = resolved
+        .as_deref()
+        .map(|p| p.as_os_str())
+        .unwrap_or_else(|| target.command.as_ref());
+    let mut command = Command::new(program);
     command
         .args(&target.args)
         .envs(target.env.iter().map(|(key, value)| (key, value)));
@@ -980,11 +1091,15 @@ impl RecordingSession {
         options: &RecordOptions,
     ) -> Result<Self, RecorderDiagnostic> {
         let program_name = target_program_name(&options.target[0]);
+        // Recorded program argv (everything after the launcher command) is
+        // forwarded into the CTFS `meta.dat` metadata via the Nim writer.
+        let program_args: Vec<String> = options.target.iter().skip(1).cloned().collect();
         let runtime = RuntimeSession::prepare(options)?;
         let prepared_target = runtime.prepare_target(options)?;
         let writer = panic::catch_unwind({
             let program_name = program_name.clone();
-            move || NimTraceWriter::new(&program_name, NimFormat::Ctfs)
+            let program_args = program_args.clone();
+            move || NimTraceWriter::new(&program_name, &program_args, NimFormat::Ctfs)
         })
         .map_err(|payload| {
             RecorderDiagnostic::writer_initialization_failed(panic_payload(payload))
@@ -2979,26 +3094,62 @@ fn compile_runtime_app(out_dir: &Path, target_command: &str) -> Result<PathBuf, 
     Ok(ebin_dir)
 }
 
+/// Run a BEAM tool (`erlc`, `elixir`, `erl`, …) to completion, capturing
+/// its output.
+///
+/// Resolves Windows `.bat`/`.cmd` launchers via `resolve_target_command`
+/// (the OS launcher behind `Command::new` only appends `.exe`), and
+/// routes a resolved batch launcher through `cmd /c` with a hand-built,
+/// cmd-quoted command line so the `-e <elixir expr>` payload survives
+/// Rust >= 1.77's batch-argument validator *and* cmd's re-tokenization.
+fn run_beam_tool(program: &str, args: &[&str]) -> io::Result<std::process::Output> {
+    let resolved = resolve_target_command(program);
+
+    #[cfg(windows)]
+    if let Some(path) = resolved.as_deref() {
+        if is_windows_batch(path) {
+            use std::os::windows::process::CommandExt;
+            let mut line = String::from("/c \"");
+            line.push_str(&cmd_quote(&path.display().to_string()));
+            for arg in args {
+                line.push(' ');
+                line.push_str(&cmd_quote(arg));
+            }
+            line.push('"');
+            return Command::new("cmd").raw_arg(&line).output();
+        }
+    }
+
+    let program_os: &std::ffi::OsStr = resolved
+        .as_deref()
+        .map(|p| p.as_os_str())
+        .unwrap_or_else(|| program.as_ref());
+    Command::new(program_os).args(args).output()
+}
+
 fn compile_erlang_runtime_source(
     source: &Path,
     ebin_dir: &Path,
     compiler: RuntimeCompiler,
 ) -> io::Result<std::process::Output> {
     match compiler {
-        RuntimeCompiler::Erlc => Command::new("erlc")
-            .arg("+debug_info")
-            .arg("-o")
-            .arg(ebin_dir)
-            .arg(source)
-            .output(),
-        RuntimeCompiler::Elixir => Command::new("elixir")
-            .arg("-e")
-            .arg(format!(
+        RuntimeCompiler::Erlc => run_beam_tool(
+            "erlc",
+            &[
+                "+debug_info",
+                "-o",
+                &ebin_dir.display().to_string(),
+                &source.display().to_string(),
+            ],
+        ),
+        RuntimeCompiler::Elixir => {
+            let expr = format!(
                 "case :compile.file({source}, [:debug_info, {{:outdir, {outdir}}}]) do {{:ok, _}} -> :ok; other -> raise inspect(other) end",
                 source = elixir_charlist(&source.display().to_string()),
                 outdir = elixir_charlist(&ebin_dir.display().to_string())
-            ))
-            .output(),
+            );
+            run_beam_tool("elixir", &["-e", &expr])
+        }
     }
 }
 
@@ -3402,12 +3553,16 @@ fn run_forms_instrumenter(
         locations = erlang_string(&locations_path.display().to_string()),
         dump = erlang_string(&dump_path.display().to_string())
     );
-    let output = Command::new("erl")
-        .args(["-noshell", "-pa"])
-        .arg(runtime_ebin)
-        .arg("-eval")
-        .arg(expression)
-        .output()?;
+    let output = run_beam_tool(
+        "erl",
+        &[
+            "-noshell",
+            "-pa",
+            &runtime_ebin.display().to_string(),
+            "-eval",
+            &expression,
+        ],
+    )?;
     if output.status.success() {
         Ok(())
     } else {
@@ -3917,8 +4072,32 @@ fn is_source_file(path: &Path) -> bool {
     )
 }
 
+/// Strip the Windows `\\?\` / `\\?\UNC\` verbatim prefix that
+/// `std::fs::canonicalize` prepends on Windows.
+///
+/// Verbatim paths are valid for the OS but are *not* portable: DAP
+/// clients (editors, IDEs), source-map consumers, and humans expect
+/// ordinary `C:\dir\file` paths. Leaving the prefix in the recorded
+/// trace makes the recorded source path compare unequal to the same
+/// file referenced any other way. On non-Windows targets this is a
+/// no-op.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(text) = path.to_str() {
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{rest}"));
+            }
+            if let Some(rest) = text.strip_prefix(r"\\?\") {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
+}
+
 fn normalize_build_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -3926,7 +4105,8 @@ fn normalize_build_path(path: &Path) -> PathBuf {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(path)
         }
-    })
+    });
+    strip_verbatim_prefix(resolved)
 }
 
 fn project_relative_path(source_root: &Path, path: &Path) -> String {
@@ -4102,13 +4282,19 @@ fn wrap_elixir_expression(expression: &str, runtime: &RuntimeSession) -> String 
         .as_ref()
         .map(|path| {
             format!(
-                ":code.add_patha({})\n",
+                ":code.add_patha({}); ",
                 elixir_charlist(&path.display().to_string())
             )
         })
         .unwrap_or_default();
+    // The whole wrapped program is emitted on a SINGLE line, using `;`
+    // statement separators rather than newlines. On Windows this
+    // expression is handed to `mix run -e` through `cmd /c`, and an
+    // embedded newline would terminate the cmd command line regardless
+    // of quoting. `;` is an equivalent Elixir statement separator and
+    // `try do … after … end` is valid inline.
     format!(
-        ":code.add_patha({runtime_ebin})\n{instrumented_path}{purge_modules}:ok = :codetracer_erlang_runtime.start_session({options})\ntry do\n  {expression}\nafter\n  :ok = :codetracer_erlang_runtime.stop_session(:normal)\nend",
+        ":code.add_patha({runtime_ebin}); {instrumented_path}{purge_modules}:ok = :codetracer_erlang_runtime.start_session({options}); try do {expression} after :ok = :codetracer_erlang_runtime.stop_session(:normal) end",
         runtime_ebin = runtime_ebin,
         instrumented_path = instrumented_path,
         purge_modules = elixir_purge_trace_modules(&runtime.trace_functions),
@@ -4235,8 +4421,12 @@ fn elixir_purge_trace_modules(functions: &[TraceFunctionSpec]) -> String {
     modules
         .iter()
         .map(|module| {
+            // `;` statement separators (not newlines) so the whole wrapped
+            // expression stays on a single line — required for it to
+            // survive a `cmd /c` invocation on Windows, where a newline
+            // terminates the command regardless of quoting.
             format!(
-                ":code.purge({module})\n:code.delete({module})\n",
+                ":code.purge({module}); :code.delete({module}); ",
                 module = elixir_atom(module)
             )
         })
@@ -4629,7 +4819,7 @@ fn write_ctfs_fixture(out_dir: &Path) -> Result<FixtureSummary, Box<dyn Error>> 
     let source_path = fixture_source_path();
     let events_path = out_dir.join("trace.json");
 
-    let mut writer = NimTraceWriter::new(FIXTURE_PROGRAM, NimFormat::Ctfs);
+    let mut writer = NimTraceWriter::new(FIXTURE_PROGRAM, &[], NimFormat::Ctfs);
     writer.set_workdir(&env::current_dir()?);
     writer.begin_writing_trace_events(&events_path)?;
     writer.start(&source_path, Line(1));
