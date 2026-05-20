@@ -2540,7 +2540,7 @@ impl FunctionInterner {
                 location_id: 0,
                 clause_id: 0,
                 resolved_source_path: runtime_location
-                    .map(|location| PathBuf::from(&location.build_path))
+                    .map(|location| normalize_build_path(Path::new(&location.build_path)))
                     .unwrap_or_else(|| source_root.join("<unknown>")),
                 resolved_line: runtime_location.map(|location| location.line).unwrap_or(1),
                 resolved_column: runtime_location.and_then(|location| location.column),
@@ -3051,6 +3051,25 @@ fn read_standalone_build_summary(
                 .to_string();
         }
     }
+
+    // Re-root every recorded source path through `normalize_build_path`.
+    // The Elixir-side `build_mix_project` emits paths in the BEAM
+    // `filename` convention (lowercase drive, forward slashes — `d:/...`),
+    // while Rust source discovery yields the OS-native `D:\...`. Without
+    // this, a step recorded against `d:/.../foo.ex` and a breakpoint
+    // resolved against `D:\...\foo.ex` land on two different PathIds in
+    // the trace and never match — breakpoints silently never fire on
+    // Windows. Canonicalizing both to the same spelling fixes this.
+    for spec in &mut build.step_locations {
+        spec.resolved_source_path = normalize_build_path(&spec.resolved_source_path);
+    }
+    for func in &mut build.trace_functions {
+        func.resolved_source_path = normalize_build_path(&func.resolved_source_path);
+    }
+    for path in &mut build.source_paths {
+        *path = normalize_build_path(path);
+    }
+
     Ok(build)
 }
 
@@ -3480,7 +3499,15 @@ fn instrument_erlang_sources(
                 module: parsed.module.clone(),
                 source_path: raw_source,
                 location_id: raw.id,
-                resolved_source_path: PathBuf::from(&resolved.build_path),
+                // Normalize through `normalize_build_path` so the path a
+                // step is recorded against matches the canonical spelling
+                // used for the discovered source-file list. The Elixir
+                // source map emits paths with a lowercase drive letter and
+                // forward slashes (`d:/...`), while source discovery yields
+                // the OS-native `D:\...`; leaving them unequal made the
+                // trace carry two PathIds for one file, so a breakpoint
+                // resolved to one PathId never matched steps on the other.
+                resolved_source_path: normalize_build_path(Path::new(&resolved.build_path)),
                 resolved_line: resolved.line,
                 resolved_column: resolved.column,
                 resolution_strategy: resolved.resolution,
