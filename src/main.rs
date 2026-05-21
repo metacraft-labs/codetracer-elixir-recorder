@@ -562,6 +562,15 @@ struct PreparedTarget {
     args: Vec<String>,
     env: Vec<(String, String)>,
     injection_decision: String,
+    /// BEAM module that hosts the recording entry point (e.g.
+    /// `canonical_flow` for `-s canonical_flow main`). Used to anchor the
+    /// trace's `start()` location on the entry module's *source file*
+    /// rather than on whichever discovered path happens to sort first —
+    /// the latter wrongly picks build manifests like `Makefile`,
+    /// `rebar.config`, or `mix.exs` over the real `.erl`/`.ex` source.
+    /// `None` for non-BEAM targets and Mix `-e` expressions where no
+    /// single entry module is identifiable.
+    entry_module: Option<String>,
 }
 
 impl PreparedTarget {
@@ -573,6 +582,7 @@ impl PreparedTarget {
             args: iter.collect(),
             env: Vec::new(),
             injection_decision: "runtime not injected for non-BEAM target".to_string(),
+            entry_module: None,
         }
     }
 }
@@ -1120,6 +1130,50 @@ impl RecordingSession {
         Ok(session)
     }
 
+    /// Pick the source file the trace's `start()` location should anchor
+    /// on.
+    ///
+    /// The writer's `start()` location becomes step #0 of the trace —
+    /// it is what the GUI shows after `run-to-entry` before the runtime's
+    /// own trace events advance the cursor. It must therefore name the
+    /// program's *entry source file* (`canonical_flow.erl` /
+    /// `canonical_flow.ex`), never a build manifest.
+    ///
+    /// `RuntimeSession::source_paths` is the sorted+deduped output of
+    /// `discover_source_paths`, which appends build manifests
+    /// (`Makefile`, `rebar.config`, `mix.exs`) after the real sources and
+    /// then sorts the whole list. Sorting interleaves them, so a bare
+    /// `.first()` frequently returns `…/canonical_flow/Makefile` — the
+    /// historical cause of the GUI landing on `Makefile:1`.
+    ///
+    /// Selection order:
+    ///   1. The source file whose stem matches the recorded entry module
+    ///      (`PreparedTarget::entry_module`), if known.
+    ///   2. Otherwise, the first discovered path that is *not* a build
+    ///      manifest.
+    ///   3. Otherwise (only build manifests, or nothing discovered),
+    ///      `None` so the caller falls back to the recording anchor.
+    fn select_start_anchor(&self) -> Option<PathBuf> {
+        let paths = &self.runtime.source_paths;
+
+        if let Some(entry_module) = self.prepared_target.entry_module.as_deref() {
+            if let Some(matching) = paths.iter().find(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.eq_ignore_ascii_case(entry_module))
+                    .unwrap_or(false)
+            }) {
+                return Some(matching.clone());
+            }
+        }
+
+        paths
+            .iter()
+            .find(|path| !is_build_manifest(path))
+            .or_else(|| paths.first())
+            .cloned()
+    }
+
     fn initialize_writer(&mut self) -> Result<(), RecorderDiagnostic> {
         let current_dir = env::current_dir().map_err(|error| {
             RecorderDiagnostic::writer_initialization_failed(format!(
@@ -1128,10 +1182,7 @@ impl RecordingSession {
         })?;
         let events_path = self.out_dir.join("trace.json");
         let source_path = self
-            .runtime
-            .source_paths
-            .first()
-            .cloned()
+            .select_start_anchor()
             .unwrap_or_else(|| recording_anchor_path(&self.options.target[0]));
 
         let write_probe_path = self.out_dir.join(".codetracer-writer-init-check");
@@ -2167,6 +2218,7 @@ impl RuntimeSession {
             injection_decision:
                 "plain erl M4 injection plus M8 instrumentation: add -pa compiled runtime ebin and instrumented ebin, replace -s entrypoint/-s init stop with an -eval wrapper that starts and stops the runtime session"
                     .to_string(),
+            entry_module: Some(module),
         })
     }
 
@@ -3172,6 +3224,21 @@ fn compile_erlang_runtime_source(
     }
 }
 
+/// Names of build-system manifest files discovered alongside real BEAM
+/// sources. They belong in the trace path table (the GUI can open them)
+/// but must never be chosen as the trace's `start()` anchor — see
+/// [`RecordingSession::select_start_anchor`].
+const BUILD_MANIFEST_FILENAMES: [&str; 3] = ["mix.exs", "rebar.config", "Makefile"];
+
+/// Returns `true` if `path`'s file name is a known build-system manifest
+/// (`mix.exs`, `rebar.config`, `Makefile`) rather than a program source.
+fn is_build_manifest(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| BUILD_MANIFEST_FILENAMES.iter().any(|manifest| name.eq_ignore_ascii_case(manifest)))
+        .unwrap_or(false)
+}
+
 fn discover_source_paths(source_root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for dirname in ["lib", "src", "test"] {
@@ -3180,7 +3247,7 @@ fn discover_source_paths(source_root: &Path) -> io::Result<Vec<PathBuf>> {
             collect_source_paths(&dir, &mut paths)?;
         }
     }
-    for filename in ["mix.exs", "rebar.config", "Makefile"] {
+    for filename in BUILD_MANIFEST_FILENAMES {
         let file = source_root.join(filename);
         if file.is_file() {
             paths.push(file);
